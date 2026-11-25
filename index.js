@@ -571,7 +571,10 @@ class CiteDB extends siyuan.Plugin {
       insertRow(firstRow());
     });
     const confirmLaw = function (e) {
-      if (e && e.key === "Enter") e.preventDefault();
+      if (e && e.type === "keydown") {
+        if (e.key !== "Enter" || e.isComposing) return;
+        e.preventDefault();
+      }
       insertRow(pending || firstRow());
     };
     art.addEventListener("keydown", confirmLaw);
@@ -737,6 +740,15 @@ class CiteDB extends siyuan.Plugin {
         order.push(m[1]);
       }
     }
+    /* 同一条法规可能引不同条款：[5条]、[7条] 要各占一个号，不能因为 docId 相同就并成一条。
+       做法是按引用在正文里出现的先后，依次取出库里同 docId 的条目；用完了就复用最后一条（重复引用同一处）。 */
+    const pool = {};
+    refs.forEach(function (r, idx) {
+      if (!r.docId) return;
+      if (!pool[r.docId]) pool[r.docId] = [];
+      pool[r.docId].push({ idx: idx, used: false, n: r.n });
+    });
+
     const assigned = {};
     const out = [];
     const changed = [];
@@ -760,18 +772,36 @@ class CiteDB extends siyuan.Plugin {
       const md = clean.replace(CiteDB.MARKER, function (whole, refId, n1, n2, linkId, n3) {
         const docId = refId || linkId || "";
         const oldN = Number(refId ? n1 : n2 || n3);
-        const key = docId || "#" + oldN;
-        if (!assigned[key]) {
-          next += 1;
-          let base = null;
-          if (docId) {
-            for (let q = 0; q < refs.length; q++) {
-              if (refs[q].docId === docId) {
-                base = refs[q];
+        let key;
+        if (docId && pool[docId]) {
+          const list = pool[docId];
+          let pick = null;
+          /* 先看编号正好对得上的（同一处引用重复插入时，正文里的老号就是它自己的号） */
+          for (let q = 0; q < list.length; q++) {
+            if (list[q].n === oldN) {
+              pick = list[q];
+              break;
+            }
+          }
+          /* 再按正文顺序取还没用过的那条 */
+          if (!pick) {
+            for (let q = 0; q < list.length; q++) {
+              if (!list[q].used) {
+                pick = list[q];
                 break;
               }
             }
           }
+          if (!pick) pick = list[list.length - 1];
+          pick.used = true;
+          key = "r" + pick.idx;
+        } else {
+          key = "#" + oldN;
+        }
+        if (!assigned[key]) {
+          next += 1;
+          let base = null;
+          if (key.charAt(0) === "r") base = refs[Number(key.slice(1))] || null;
           if (!base) base = byN[oldN] || null;
           const entry = base
             ? JSON.parse(JSON.stringify(base))
