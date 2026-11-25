@@ -8,6 +8,7 @@ const VERSION = "0.2.0";
 const DATA_FILE = "citedb.json";
 const ATTR_REFS = "custom-citedb-refs";
 const ATTR_BIB = "custom-citedb-bib";
+const ATTR_NOTES = "custom-citedb-notes"; /* 法规走尾注，单独存一份，别和参考文献混 */
 
 const ICON_SVG = `<symbol id="iconCiteDB" viewBox="0 0 32 32"><rect x="0.6" y="0.6" width="30.8" height="30.8" rx="7.5" fill="#F0872A"/><g transform="translate(5.401,23.771) scale(0.01096,-0.01096)"><path d="M1526 1667H1820V-249H1526ZM432 637H1184L1151 120Q1141 -15 1088.5 -99.5Q1036 -184 943.0 -216.5Q850 -249 386 -249Q350 -97 304 41Q456 33 607 33Q729 33 773.5 51.5Q818 70 833.0 114.0Q848 158 862 379H114L180 1115H884V1343H122V1601H1178V857H448Z" fill="#FFFFFF"/></g></symbol>`;
 
@@ -19,6 +20,10 @@ const ROLE_LABELS = {
   issue: "卷期",
   pages: "页码",
   wenhao: "文号",
+  type: "文献类型",
+  place: "出版地",
+  translator: "译者",
+  subtitle: "副标题",
 };
 
 /* 字段名 -> 角色 的猜测规则（用户之后可在界面里改） */
@@ -81,19 +86,33 @@ function avRows(view, map) {
   ((view && view.rows) || []).forEach(function (row) {
     const cells = {};
     let docID = "";
+    let linkable = false;
     ((row.cells) || []).forEach(function (c) {
       const v = c.value || {};
       const key = v.keyID || c.keyID || c.id;
       if (!key) return;
       cells[key] = cellText(v);
-      if (!docID && v.block && v.block.id) docID = v.block.id;
+      /* 身份 id：优先 v.blockID（库里每格都带），它是这一行/这一格自己的 id；
+         只有「格子绑的是文档」时（v.block.id 有值，如法规库）才给它做跳转链接，
+         文献库的格子是普通段落，链接过去打不开，就退回纯编号 */
+      if (v.block && v.block.id) {
+        linkable = true;
+        if (!docID) docID = v.block.id;
+      }
+      if (!docID) {
+        if (v.blockID) docID = v.blockID;
+        else {
+          const mm = /data-node-id="([^"]+)"/.exec((v.block && v.block.richBlockDOM) || "");
+          if (mm) docID = mm[1];
+        }
+      }
     });
     const title = (map.title && cells[map.title]) || "";
     if (!String(title).trim()) return;
     out.push({
       rowID: row.id,
       docID: docID || row.id,
-      linked: !!docID,
+      linked: linkable,
       cells: cells,
       title: String(title).trim(),
     });
@@ -128,41 +147,109 @@ function cleanLawTitle(title, wenhao) {
   return t.replace(/\s{2,}/g, " ").trim();
 }
 
-/** 生成一条引注文字 */
-function citeText(src, cells, article) {
+/* ---------- 圈码（尾注用） ---------- */
+const CIRCLED_RANGE = "①-⑳㉑-㉟㊱-㊿";
+function cir(n) {
+  n = Number(n) || 0;
+  if (n >= 1 && n <= 20) return String.fromCharCode(0x2460 + n - 1);
+  if (n >= 21 && n <= 35) return String.fromCharCode(0x3251 + n - 21);
+  if (n >= 36 && n <= 50) return String.fromCharCode(0x32b1 + n - 36);
+  return "(" + n + ")";
+}
+function cirIndex(ch) {
+  const c = String(ch || "").charCodeAt(0);
+  if (c >= 0x2460 && c <= 0x2473) return c - 0x2460 + 1;
+  if (c >= 0x3251 && c <= 0x325f) return c - 0x3251 + 21;
+  if (c >= 0x32b1 && c <= 0x32bf) return c - 0x32b1 + 36;
+  return 0;
+}
+function isCircled(ch) {
+  const c = String(ch || "").charCodeAt(0);
+  return (c >= 0x2460 && c <= 0x2473) || (c >= 0x3251 && c <= 0x325f) || (c >= 0x32b1 && c <= 0x32bf);
+}
+
+/* ---------- GB/T 7714-2015 顺序编码制 ---------- */
+const TYPE_CODE = { 图书: "M", 期刊文章: "J", 学位论文: "D", 报纸: "N", 论文集: "C", 标准: "S", 电子资源: "EB/OL" };
+
+function typeCode(s) {
+  const t = String(s || "").trim();
+  for (const k in TYPE_CODE) if (t.indexOf(k) >= 0) return TYPE_CODE[k];
+  return "M";
+}
+
+/** 责任者：逗号/顿号/分号分隔；超过 3 个只留前 3 个加「, 等」 */
+function authorList(s) {
+  const arr = String(s || "")
+    .split(/[，,；;、\/]+/)
+    .map(function (x) { return x.trim(); })
+    .filter(function (x) { return x && x !== "等"; });
+  if (!arr.length) return "";
+  if (arr.length > 3) return arr.slice(0, 3).join(", ") + ", 等";
+  return arr.join(", ");
+}
+
+/** 卷期里常写成「2026（9）」，把年份拆出来 */
+function splitIssue(raw, year) {
+  let issue = String(raw || "").trim().replace(/）/g, ")").replace(/（/g, "(");
+  const m = issue.match(/^(\d{4})\s*\(?\s*([^)]*?)\s*\)?$/);
+  if (m) {
+    if (!year) year = m[1];
+    issue = (m[2] || "").trim();
+  }
+  return { year: year || "", issue: issue };
+}
+
+/** 文献库 → 参考文献条目（GB/T 7714-2015 顺序编码制）
+ *  图书：贾宁. 贾宁财务讲义[M]. 北京: 中信出版集团, 2020: 45.
+ *  译著：惠特默. 高绩效教练: 原书第5版[M]. 林菲, 译. 北京: 机械工业出版社, 2018: 12.
+ *  期刊：张某. 增值税留抵退税的风险识别[J]. 税务研究, 2023(9): 55-58.
+ *  extra 是引用页码（图书才有，插入时手填）
+ */
+function citePaper(src, cells, extra) {
   const g = function (role) {
     const k = src.map && src.map[role];
     return k && cells[k] ? String(cells[k]).trim() : "";
   };
   const title = g("title");
-  if (!title) return "见（缺题名）";
-  if (src.kind === "law") {
-    const wenhao = g("wenhao");
-    const s = "《" + cleanLawTitle(title, wenhao) + "》";
-    let out = s;
-    if (wenhao) out += "（" + wenhao + "）";
-    if (article) out += "第" + article + "条";
-    return "见" + out + "。";
-  }
-  const parts = [];
-  const author = g("author");
-  parts.push((author ? author + "：" : "") + "《" + title + "》");
+  if (!title) return "（缺题名）";
+  const code = typeCode(g("type"));
+  const authors = authorList(g("author"));
+  const sub = g("subtitle");
+  const trans = authorList(g("translator"));
   const container = g("container");
-  if (container) parts.push(container);
-  let year = g("year");
-  let issue = g("issue");
-  /* 卷期里常写成「2026（9）」，把年份拆出来，避免出现 (2026（9）) 这种叠字 */
-  const m = issue.match(/^\s*(\d{4})\s*[（(]?\s*([^）)]*?)\s*[）)]?\s*$/);
-  if (m) {
-    if (!year) year = m[1];
-    issue = (m[2] || "").trim();
-  }
-  let tail = year;
-  if (issue) tail += "(" + issue + ")";
-  const pages = g("pages");
-  if (pages) tail += (tail ? "：" : "") + pages;
-  if (tail) parts.push(tail);
-  return "见" + parts.join("，") + "。";
+  const place = g("place");
+  const si = splitIssue(g("issue"), g("year"));
+  let out = authors ? authors + ". " : "";
+  out += title + (sub ? ": " + sub : "") + "[" + code + "]";
+  if (trans) out += ". " + trans + ", 译";
+  /* 期刊不写出版地（GB/T 7714 里期刊只到刊名），图书才写「北京: 中信出版集团」 */
+  if (container) out += ". " + (place && code !== "J" ? place + ": " : "") + container;
+  if (si.year) out += ", " + si.year;
+  if (code === "J" && si.issue) out += "(" + si.issue + ")";
+  const p = code === "J" ? g("pages") : String(extra || "").trim();
+  if (p) out += ": " + p;
+  return out + ".";
+}
+
+/** 法规 → 尾注文字：《法规名》（文号）第X条。 */
+function citeLaw(src, cells, article) {
+  const g = function (role) {
+    const k = src.map && src.map[role];
+    return k && cells[k] ? String(cells[k]).trim() : "";
+  };
+  const title = g("title");
+  if (!title) return "（缺法规名）";
+  const wenhao = g("wenhao");
+  let out = "《" + cleanLawTitle(title, wenhao) + "》";
+  if (wenhao) out += "（" + wenhao + "）";
+  const a = String(article || "").trim();
+  if (a) out += "第" + a + "条";
+  return out + "。";
+}
+
+function citeText(src, cells, extra) {
+  if (src.kind === "law") return citeLaw(src, cells, extra);
+  return citePaper(src, cells, extra);
 }
 
 /* ---------------- 插件 ---------------- */
@@ -444,9 +531,9 @@ class CiteDB extends siyuan.Plugin {
       '<input id="citeDB-kw" class="b3-text-field" placeholder="输入关键词开始搜索">' +
       "</div>" +
       '<div class="citeDB-bar" id="citeDB-extra" style="display:none">' +
-      '<span class="citeDB-law">第</span>' +
+      '<span class="citeDB-law" id="citeDB-lbl">第</span>' +
       '<input id="citeDB-art" class="b3-text-field" placeholder="条号，如 五 或 5（可留空）">' +
-      '<span class="citeDB-law">条</span>' +
+      '<span class="citeDB-law" id="citeDB-lbl2">条</span>' +
       '<button id="citeDB-go" class="b3-button b3-button--outline">插入</button></div>' +
       '<div class="citeDB-results" id="citeDB-results"><div class="citeDB-tip">输入关键词开始搜索</div></div>' +
       '<div class="citeDB-tip" id="citeDB-hint">插入的是 [n] 形式的引用，点它可跳回原文献。</div>' +
@@ -458,6 +545,8 @@ class CiteDB extends siyuan.Plugin {
     const art = root.querySelector("#citeDB-art");
     const extra = root.querySelector("#citeDB-extra");
     const goBtn = root.querySelector("#citeDB-go");
+    const lbl = root.querySelector("#citeDB-lbl");
+    const lbl2 = root.querySelector("#citeDB-lbl2");
     const hint = root.querySelector("#citeDB-hint");
     const box = root.querySelector("#citeDB-results");
     let rows = [];
@@ -467,19 +556,39 @@ class CiteDB extends siyuan.Plugin {
       return sources[Number(srcSel.value)];
     };
 
+    /* 法规用「第 __ 条」，图书用「页码 __」，期刊不用（起止页码在库里） */
+    const isLawSrc = function () { return srcOf().kind === "law"; };
+    const isBookRow = function (row) {
+      const src = srcOf();
+      if (src.kind === "law") return true;
+      const t = src.map && src.map.type ? String(row.cells[src.map.type] || "").trim() : "";
+      return !t || t.indexOf("图书") >= 0 || t.indexOf("专著") >= 0 || t.indexOf("论文集") >= 0;
+    };
+    const needsStep2 = function (row) { return !!row && isBookRow(row); };
+
     const insertRow = function (row) {
       if (!row) return;
       const src = srcOf();
-      const article = src.kind === "law" ? art.value.trim() : "";
+      const extra = needsStep2(row) ? art.value.trim() : "";
       dialog.destroy();
-      self.safe(() => self.doInsert(protyle, src, row, article));
+      self.safe(() => self.doInsert(protyle, src, row, extra));
     };
 
     const loadRows = async function () {
       const src = srcOf();
       const isLaw = src.kind === "law";
-      extra.style.display = isLaw ? "" : "none";
+      extra.style.display = "";
+      if (isLaw) {
+        lbl.textContent = "第";
+        lbl2.textContent = "条";
+        art.placeholder = "条号，如 五 或 5（可留空）";
+      } else {
+        lbl.textContent = "页码";
+        lbl2.textContent = "";
+        art.placeholder = "引用页码，如 45 或 45-46（图书才用，可留空）";
+      }
       kw.placeholder = isLaw ? "输入法规关键词，回车选中" : "输入关键词，回车插入";
+      art.value = "";
       pending = null;
       box.innerHTML = '<div class="citeDB-tip">读取中…</div>';
       const avID = await self.resolveAv(src.avID);
@@ -530,15 +639,15 @@ class CiteDB extends siyuan.Plugin {
       box.querySelectorAll(".citeDB-item").forEach(function (el) {
         el.addEventListener("click", function () {
           const row = rows[Number(el.getAttribute("data-i"))];
-          if (srcOf().kind === "law" && !art.value.trim()) {
-            /* 法规：先选中，再让用户选/填第几条，最后按「插入」或回车 */
+          if (needsStep2(row) && !art.value.trim()) {
+            /* 法规 / 图书：先选中，再填条号或页码，最后按回车或「插入」 */
             pending = row;
             render(kw.value.trim());
             art.value = "";
             art.focus();
-            hint.textContent =
-              "已选《" + String(cleanLawTitle(row.title, row.cells[srcOf().map.wenhao])).slice(0, 30) +
-              "》：填第几条（可留空），回车或点「插入」。";
+            hint.textContent = isLawSrc()
+              ? "已选《" + String(cleanLawTitle(row.title, row.cells[srcOf().map.wenhao])).slice(0, 30) + "》：填第几条（可留空），回车或点「插入」。"
+              : "已选《" + String(row.title).slice(0, 30) + "》：填引用页码（可留空），回车或点「插入」。";
             return;
           }
           insertRow(row);
@@ -555,20 +664,20 @@ class CiteDB extends siyuan.Plugin {
     kw.addEventListener("keydown", function (e) {
       if (e.key !== "Enter" || e.isComposing) return;
       e.preventDefault();
-      if (srcOf().kind === "law") {
-        /* 法规：回车只「选中」，把光标送去条号框，填完再回车才插入 */
-        const row = pending || firstRow();
-        if (!row) return;
+      const row = pending || firstRow();
+      if (!row) return;
+      if (needsStep2(row)) {
+        /* 法规 / 图书：回车只「选中」，把光标送去条号或页码框，填完再回车才插入 */
         pending = row;
         render(kw.value.trim());
         art.value = "";
         art.focus();
-        hint.textContent =
-          "已选《" + String(cleanLawTitle(row.title, row.cells[srcOf().map.wenhao])).slice(0, 30) +
-          "》：填第几条（可留空），回车或点「插入」。";
+        hint.textContent = isLawSrc()
+          ? "已选《" + String(cleanLawTitle(row.title, row.cells[srcOf().map.wenhao])).slice(0, 30) + "》：填第几条（可留空），回车或点「插入」。"
+          : "已选《" + String(row.title).slice(0, 30) + "》：填引用页码（可留空），回车或点「插入」。";
         return;
       }
-      insertRow(firstRow());
+      insertRow(row);
     });
     const confirmLaw = function (e) {
       if (e && e.type === "keydown") {
@@ -639,37 +748,48 @@ class CiteDB extends siyuan.Plugin {
   }
 
   /* ---------------- 插入 ---------------- */
-  async doInsert(protyle, src, row, article) {
+  async doInsert(protyle, src, row, extra) {
     const target = this.resolveTarget(protyle);
     const docID = target.docID;
     const attrs = (await this.api("/api/attr/getBlockAttrs", { id: docID })) || {};
-    let refs = [];
-    try { refs = JSON.parse(attrs[ATTR_REFS] || "[]"); } catch (e) { refs = []; }
-    const text = citeText(src, row.cells, article);
-    let hit = refs.find(function (r) { return r.docId === row.docID && (r.article || "") === (article || ""); });
+    /* 法规走尾注（①②），文献走参考文献（[n]），两本账分开记 */
+    const isLaw = src.kind === "law";
+    const ATTR = isLaw ? ATTR_NOTES : ATTR_REFS;
+    let list = [];
+    try {
+      list = JSON.parse(attrs[ATTR] || "[]");
+    } catch (e) {
+      list = [];
+    }
+    const key = String(extra || "").trim();
+    const text = citeText(src, row.cells, key);
+    let hit = list.find(function (r) {
+      return r.docId === row.docID && String(r.article || "") === key;
+    });
     if (!hit) {
-      const n = refs.reduce(function (m, r) { return Math.max(m, r.n || 0); }, 0) + 1;
-      hit = { n: n, docId: row.docID, rowID: row.rowID, linked: !!row.linked, article: article || "", text: text, src: src.name };
-      refs.push(hit);
+      const n = list.reduce(function (m, r) { return Math.max(m, r.n || 0); }, 0) + 1;
+      hit = { n: n, docId: row.docID, rowID: row.rowID, linked: !!row.linked, article: key, text: text, src: src.name };
+      list.push(hit);
     } else {
-      /* 这条以前引过：文字按这次的选择重写（法规名改过、文号清洗过都要跟上） */
+      /* 这条以前引过：文字按这次的选择重写（书名/文号/译者改过都要跟上） */
       hit.rowID = row.rowID;
       hit.linked = !!row.linked;
       hit.src = src.name;
       hit.text = text;
     }
-    await this.api("/api/attr/setBlockAttrs", { id: docID, attrs: { [ATTR_REFS]: JSON.stringify(refs) } });
-    /* 上标 + 思源原生块引：<sup>((id "[n]"))</sup>，渲染出来就是上标的 [n]，点它能跳。
+    await this.api("/api/attr/setBlockAttrs", { id: docID, attrs: { [ATTR]: JSON.stringify(list) } });
+    const anchor = isLaw ? cir(hit.n) : "[" + hit.n + "]";
+    /* 上标 + 思源原生块引：<sup>((id "[1]"))</sup> / <sup>((id "①"))</sup>
        （试过把 data-type="block-ref" 的 span 塞进 sup，思源会把属性吃掉只剩文字，所以走块引） */
     const md = row.linked
-      ? "<sup>((" + row.docID + ' "[' + hit.n + ']"))</sup>'
-      : "<sup>[" + hit.n + "]</sup>";
+      ? "<sup>((" + row.docID + ' \"' + anchor + '\"))</sup>'
+      : "<sup>" + anchor + "</sup>";
     const html = row.linked
-      ? '<sup><span data-type="block-ref" data-id="' + row.docID + '" data-subtype="s">[' + hit.n + "]</span></sup>"
-      : "<sup>[" + hit.n + "]</sup>";
+      ? '<sup><span data-type="block-ref" data-id="' + row.docID + '" data-subtype="s">' + anchor + "</span></sup>"
+      : "<sup>" + anchor + "</sup>";
     target.insert(md, html);
-    siyuan.showMessage("已插入 [" + hit.n + "]：" + text, 3000);
-    /* 文末已经有参考文献的，插入后把编号和列表同步一次（没有就先不管，等用户刷新） */
+    siyuan.showMessage("已插入 " + anchor + "：" + text, 3000);
+    /* 文末已经有列表的，插入后把编号和列表同步一次（没有就先不管，等用户刷新） */
     const self2 = this;
     try {
       const a = (await this.api("/api/attr/getBlockAttrs", { id: docID })) || {};
@@ -712,18 +832,30 @@ class CiteDB extends siyuan.Plugin {
   /** 按正文出现顺序重排编号（同一条文献复用同一个号），并把新编号写回正文。
    *  只处理「段落 p / 标题 h」两种块：列表项的文字其实在它的 p 子块里，
    *  直接对列表块写回会把兄弟块的属性带进去，思源会报 block ID already exists。 */
+  /** 法规尾注的标记：((id "①")) */
+  static get NOTE_MARKER() {
+    return new RegExp('\\(\\((\\S+?)\\s+"([' + CIRCLED_RANGE + '])"\\)\\)', "g");
+  }
+
+  /** 按正文出现顺序重排编号，并把新编号写回正文。
+   *  - 文献：正文 [n]，同一文档只占一个号（不同的引用页码各占一个号）
+   *  - 法规：正文 ①，同一条法规的不同条款各占一个号，重复引同一处复用同一个号
+   *  只处理「自己就是一块」的 kramdown：列表/引述这类容器块自带子块 ial，
+   *  对它写回会把兄弟块 id 带进去，思源会报 block ID already exists。
+   */
   async renumber(docID) {
     const kd = ((await this.api("/api/block/getBlockKramdown", { id: docID })) || {}).kramdown || "";
-    let refs = [];
-    try {
-      refs = JSON.parse(((await this.api("/api/attr/getBlockAttrs", { id: docID })) || {})[ATTR_REFS] || "[]");
-    } catch (e) {
-      refs = [];
-    }
-    const byN = {};
-    refs.forEach(function (r) {
-      byN[r.n] = r;
-    });
+    const attrs = (await this.api("/api/attr/getBlockAttrs", { id: docID })) || {};
+    const parse = function (raw) {
+      try {
+        return JSON.parse(raw || "[]");
+      } catch (e) {
+        return [];
+      }
+    };
+    const refs = parse(attrs[ATTR_REFS]);
+    const notes = parse(attrs[ATTR_NOTES]);
+
     const bibIDs = {};
     (await this.bibBlocks(docID)).forEach(function (id) {
       bibIDs[id] = 1;
@@ -740,19 +872,87 @@ class CiteDB extends siyuan.Plugin {
         order.push(m[1]);
       }
     }
-    /* 同一条法规可能引不同条款：[5条]、[7条] 要各占一个号，不能因为 docId 相同就并成一条。
-       做法是按引用在正文里出现的先后，依次取出库里同 docId 的条目；用完了就复用最后一条（重复引用同一处）。 */
-    const pool = {};
-    refs.forEach(function (r, idx) {
-      if (!r.docId) return;
-      if (!pool[r.docId]) pool[r.docId] = [];
-      pool[r.docId].push({ idx: idx, used: false, n: r.n });
-    });
 
-    const assigned = {};
-    const out = [];
+    /* 每条引用都能落到一个「条目」，条目按文档顺序取号。
+       同一 docId 有多条（不同条款/不同页码）时：先找编号正好对得上的，再取还没用过的，最后复用最后一条。 */
+    const mkPool = function (arr) {
+      const pool = {};
+      arr.forEach(function (r, idx) {
+        if (!r.docId) return;
+        if (!pool[r.docId]) pool[r.docId] = [];
+        pool[r.docId].push({ idx: idx, used: false, n: r.n });
+      });
+      return pool;
+    };
+    const pickIn = function (pool, docId, oldN) {
+      const list = pool[docId];
+      if (!list) return null;
+      let pick = null;
+      for (let q = 0; q < list.length; q++) {
+        if (list[q].n === oldN) {
+          pick = list[q];
+          break;
+        }
+      }
+      for (let q = 0; !pick && q < list.length; q++) {
+        if (!list[q].used) pick = list[q];
+      }
+      if (!pick) pick = list[list.length - 1];
+      pick.used = true;
+      return pick;
+    };
+
+    const outR = [];
+    const outN = [];
     const changed = [];
-    let next = 0;
+    let nextR = 0;
+    let nextN = 0;
+    const assignedR = {};
+    const assignedN = {};
+    const poolR = mkPool(refs);
+    const poolN = mkPool(notes);
+
+    const take = function (kind, docId, oldN) {
+      const isRef = kind === "ref";
+      const arr = isRef ? refs : notes;
+      const pool = isRef ? poolR : poolN;
+      const assigned = isRef ? assignedR : assignedN;
+      const out = isRef ? outR : outN;
+      let base = null;
+      let key;
+      if (docId && pool[docId]) {
+        const pick = pickIn(pool, docId, oldN);
+        key = kind + ":" + pick.idx;
+        base = arr[pick.idx];
+      } else {
+        /* 没有 id 的引用（文献库那格没绑文档时）：按正文里的老编号找回条目，
+           这样条目文字还在，只是不能点 */
+        key = kind + ":#" + oldN;
+        for (let q = 0; q < arr.length; q++) {
+          if (Number(arr[q].n) === Number(oldN)) {
+            base = arr[q];
+            break;
+          }
+        }
+      }
+      if (!assigned[key]) {
+        const entry = base
+          ? JSON.parse(JSON.stringify(base))
+          : { docId: docId || "", rowID: "", linked: false, article: "", text: "", src: "" };
+        if (isRef) {
+          nextR += 1;
+          entry.n = nextR;
+        } else {
+          nextN += 1;
+          entry.n = nextN;
+        }
+        if (docId) entry.docId = docId;
+        out.push(entry);
+        assigned[key] = entry.n;
+      }
+      return assigned[key];
+    };
+
     for (let k = 0; k < order.length; k++) {
       const id = order[k];
       if (id === docID || bibIDs[id]) continue;
@@ -762,64 +962,36 @@ class CiteDB extends siyuan.Plugin {
       } catch (e) {
         continue;
       }
-      /* 只处理「自己就是一块」的：整块 kramdown 里只有一条 ial。
-         列表/引述这类容器块自带子块 ial，对它写回会把兄弟块的 id 带进去，思源报 block ID already exists */
       if ((one.match(/\{:\s*id="/g) || []).length > 1) continue;
       if (/type="doc"/.test(one)) continue;
       const clean = one.replace(/\{:[^}]*\}/g, "").trim();
       if (!clean) continue;
       let touched = false;
-      const md = clean.replace(CiteDB.MARKER, function (whole, refId, n1, n2, linkId, n3) {
+
+      /* 第一遍：参考文献 [n] */
+      let md = clean.replace(CiteDB.MARKER, function (whole, refId, n1, n2, linkId, n3) {
         const docId = refId || linkId || "";
         const oldN = Number(refId ? n1 : n2 || n3);
-        let key;
-        if (docId && pool[docId]) {
-          const list = pool[docId];
-          let pick = null;
-          /* 先看编号正好对得上的（同一处引用重复插入时，正文里的老号就是它自己的号） */
-          for (let q = 0; q < list.length; q++) {
-            if (list[q].n === oldN) {
-              pick = list[q];
-              break;
-            }
-          }
-          /* 再按正文顺序取还没用过的那条 */
-          if (!pick) {
-            for (let q = 0; q < list.length; q++) {
-              if (!list[q].used) {
-                pick = list[q];
-                break;
-              }
-            }
-          }
-          if (!pick) pick = list[list.length - 1];
-          pick.used = true;
-          key = "r" + pick.idx;
-        } else {
-          key = "#" + oldN;
-        }
-        if (!assigned[key]) {
-          next += 1;
-          let base = null;
-          if (key.charAt(0) === "r") base = refs[Number(key.slice(1))] || null;
-          if (!base) base = byN[oldN] || null;
-          const entry = base
-            ? JSON.parse(JSON.stringify(base))
-            : { docId: "", rowID: "", linked: false, article: "", text: "", src: "" };
-          entry.n = next;
-          if (docId) entry.docId = docId;
-          entry.linked = !!entry.docId;
-          out.push(entry);
-          assigned[key] = next;
-        }
-        const n = assigned[key];
+        const n = take("ref", docId, oldN);
+        if (!n) return whole;
         const repl = docId ? "((" + docId + ' "[' + n + ']"))' : "[" + n + "]";
         if (repl !== whole) touched = true;
         return repl;
       });
+
+      /* 第二遍：法规尾注 ① */
+      md = md.replace(CiteDB.NOTE_MARKER, function (whole, docId, ch) {
+        const n = take("note", docId, cirIndex(ch));
+        if (!n) return whole;
+        const repl = "((" + docId + ' "' + cir(n) + '"))';
+        if (repl !== whole) touched = true;
+        return repl;
+      });
+
       /* 统一成上标：老引用（当初没上标的）也一起升上来 */
+      const cirClass = CIRCLED_RANGE;
       const fin = md
-        .replace(/(?<!<sup>)(\(\([^()]{1,80}"\[\d+\]"\)\))/g, "<sup>$1</sup>")
+        .replace(new RegExp("(?<!<sup>)(\\(\\([^()]{1,80}\"(?:\\[\\d+\\]|[" + cirClass + "])\"\\)\\))", "g"), "<sup>$1</sup>")
         .replace(/(?<!<sup>)\[(\d+)\](?!\()/g, "<sup>[$1]</sup>")
         .trim();
       if (fin !== clean) touched = true;
@@ -829,45 +1001,44 @@ class CiteDB extends siyuan.Plugin {
     let failed = 0;
     for (let k = 0; k < changed.length; k++) {
       try {
-        await this.api("/api/block/updateBlock", {
-          id: changed[k].id,
-          dataType: "markdown",
-          data: changed[k].md,
-        });
+        await this.api("/api/block/updateBlock", { id: changed[k].id, dataType: "markdown", data: changed[k].md });
       } catch (e) {
         failed += 1;
         console.warn("[citedb] 重排写回失败", changed[k].id, e);
       }
     }
-    if (failed) throw new Error("正文编号有 " + failed + " 处没改成，参考文献没有动，可再点一次刷新");
-    return { refs: out, changed: changed.length };
+    if (failed) throw new Error("正文编号有 " + failed + " 处没改成，文末没有动，可再点一次刷新");
+    return { refs: outR, notes: outN, changed: changed.length };
   }
 
   /* ---------------- 文末参考文献 ---------------- */
 
   /** 找出这篇文档里由本插件生成的参考文献块（标题 + 每一条） */
   async bibBlocks(docID) {
-    /* 标题块的 type 是 'h'（级别在 subtype 里），不是 h4 —— 之前写成 h4 永远匹配不到，
-       标题删不掉，越刷新越多 */
+    /* 标题块的 type 是 'h'（级别在 subtype 里），不是 h4 */
     const rows =
       (await this.api("/api/query/sql", {
         stmt:
           "SELECT id, type, content FROM blocks WHERE root_id = '" + docID + "' AND (type = 'h' OR type = 'p')",
       })) || [];
+    /* 正文里的引用段落，块渲染文本恰好就是「[1]」「①」，千万别当成条目删掉：
+       条目一定是「编号 + 空白 + 内容」 */
+    const cirRe = new RegExp("^[" + CIRCLED_RANGE + "]\\s+\\S");
     const out = [];
     rows.forEach(function (r) {
       const c = (r.content || "").trim();
-      if (r.type === "h" && c === "参考文献") out.push(r.id);
-      else if (r.type === "p" && /^\[\d+\]\s*(见|\[)/.test(c)) out.push(r.id);
+      if (r.type === "h" && (c === "参考文献" || c === "注" || c === "注释")) out.push(r.id);
+      else if (r.type === "p" && (/^\[\d+\]\s+\S/.test(c) || cirRe.test(c))) out.push(r.id);
     });
     return out;
   }
+
 
   async refreshBib(protyle, silent) {
     const docID = this.resolveTarget(protyle).docID;
     const attrs = (await this.api("/api/attr/getBlockAttrs", { id: docID })) || {};
 
-    /* 1. 先删干净旧的参考文献块。上次生成时的块 id 存在属性里（SQL 索引是异步的，
+    /* 1. 先删干净旧的两个区块。上次生成时的块 id 存在属性里（SQL 索引是异步的，
        刚追加的块查不到），再按内容兜底扫一遍。 */
     const tracked = String(attrs[ATTR_BIB] || "")
       .split(",")
@@ -884,61 +1055,78 @@ class CiteDB extends siyuan.Plugin {
         await this.api("/api/block/deleteBlock", { id: olds[k] });
       } catch (e) {
         /* 已经不存在（tree not found）属正常，忽略 */
-        if (String(e && e.message).indexOf("tree not found") < 0) console.warn("[citedb] 删除旧参考文献块失败", olds[k], e);
+        if (String(e && e.message).indexOf("tree not found") < 0) console.warn("[citedb] 删除旧块失败", olds[k], e);
       }
     }
 
-    /* 2. 按正文重新编号（删掉中间的引用，后面的自动往前补；同一条文献复用一个号） */
+    /* 2. 按正文重新编号（删掉中间的引用，后面的自动往前补；同一处引用复用同一个号） */
     const re = await this.renumber(docID);
-    const kept = re.refs.filter(function (r) {
-      return r.text;
-    });
+    /* 先按库重建文字，再过滤：条目可能正处在「文字待重建」的状态（比如刚从参考文献迁到尾注） */
+    let keptR = re.refs;
+    let keptN = re.notes;
 
-    /* 条目文字一律按库里最新数据重建：法规名改过、文号清洗过、旧条目是清洗前存的，都能自动更正 */
+    /* 条目文字一律按库里最新数据重建：书名/文号/译者改过、旧条目是清洗前存的，都能自动更正 */
     const srcByName = {};
     ((this.data && this.data.sources) || []).forEach(function (x) {
       srcByName[x.name] = x;
     });
     const rowCache = {};
-    for (let q = 0; q < kept.length; q++) {
-      const r = kept[q];
-      const src = srcByName[r.src];
-      if (!src || !r.docId) continue;
-      try {
-        if (!rowCache[src.name]) {
-          const av = await this.resolveAv(src.avID);
-          const view = (await this.api("/api/av/renderAttributeView", { id: av, pageSize: 1000, page: 1 })).view;
-          const cols2 = avColumns(view);
-          if (!(src.map && src.map.title && cols2.some(function (c) { return c.id === src.map.title; }))) {
-            src.map = guessMap(cols2);
+    const rebuild = async (list) => {
+      for (let q = 0; q < list.length; q++) {
+        const r = list[q];
+        const src = srcByName[r.src];
+        if (!src || !r.docId) continue;
+        try {
+          if (!rowCache[src.name]) {
+            const av = await this.resolveAv(src.avID);
+            const view = (await this.api("/api/av/renderAttributeView", { id: av, pageSize: 1000, page: 1 })).view;
+            const cols2 = avColumns(view);
+            if (!(src.map && src.map.title && cols2.some(function (c) { return c.id === src.map.title; }))) {
+              src.map = guessMap(cols2);
+            }
+            rowCache[src.name] = avRows(view, src.map);
           }
-          rowCache[src.name] = avRows(view, src.map);
+          const row = rowCache[src.name].find(function (x) { return x.docID === r.docId; });
+          if (row) {
+            r.text = citeText(src, row.cells, r.article || "");
+            r.rowID = row.rowID;
+            r.linked = !!row.linked;
+          }
+        } catch (e) {
+          console.warn("[citedb] 重建条目文字失败", r.docId, e);
         }
-        const row = rowCache[src.name].find(function (x) { return x.docID === r.docId; });
-        if (row) {
-          r.text = citeText(src, row.cells, r.article || "");
-          r.rowID = row.rowID;
-          r.linked = !!row.linked;
-        }
-      } catch (e) {
-        console.warn("[citedb] 重建条目文字失败", r.docId, e);
       }
-    }
+    };
+    await rebuild(keptR);
+    await rebuild(keptN);
+    keptR = keptR.filter(function (r) { return r.text; });
+    keptN = keptN.filter(function (r) { return r.text; });
 
-    if (!kept.length) {
-      await this.api("/api/attr/setBlockAttrs", { id: docID, attrs: { [ATTR_REFS]: "[]", [ATTR_BIB]: "" } });
-      if (!silent) siyuan.showMessage("正文里没有引用了，参考文献已清空", 3000);
+    const self = this;
+    if (!keptR.length && !keptN.length) {
+      await this.api("/api/attr/setBlockAttrs", { id: docID, attrs: { [ATTR_REFS]: "[]", [ATTR_NOTES]: "[]", [ATTR_BIB]: "" } });
+      if (!silent) siyuan.showMessage("正文里没有引用了，文末已清空", 3000);
       return;
     }
 
-    /* 3. 生成新的参考文献；块 id 用追加前后 kramdown 的差集拿，可靠（appendBlock 返回的
-       doOperations 不一定是全部新建块） */
+    /* 3. 生成两个区块：注（法规，①②）在前，参考文献（GB/T 7714）在后。
+       块 id 用追加前后 kramdown 的差集拿，可靠（appendBlock 返回的 doOperations 不一定是全部新建块） */
     const kdBefore = ((await this.api("/api/block/getBlockKramdown", { id: docID })) || {}).kramdown || "";
-    let md = "#### 参考文献\n\n";
-    kept.forEach(function (r) {
-      const body = r.linked && r.docId ? "[" + r.text + "](siyuan://blocks/" + r.docId + ")" : r.text;
-      md += "[" + r.n + "] " + body + "\n\n";
-    });
+    let md = "";
+    if (keptN.length) {
+      md += "#### 注\n\n";
+      keptN.forEach(function (r) {
+        const body = r.linked && r.docId ? "[" + r.text + "](siyuan://blocks/" + r.docId + ")" : r.text;
+        md += cir(r.n) + " " + body + "\n\n";
+      });
+    }
+    if (keptR.length) {
+      md += "#### 参考文献\n\n";
+      keptR.forEach(function (r) {
+        const body = r.linked && r.docId ? "[" + r.text + "](siyuan://blocks/" + r.docId + ")" : r.text;
+        md += "[" + r.n + "] " + body + "\n\n";
+      });
+    }
     await this.api("/api/block/appendBlock", { parentID: docID, dataType: "markdown", data: md.trim() });
     const kdAfter = ((await this.api("/api/block/getBlockKramdown", { id: docID })) || {}).kramdown || "";
     const idOf = function (kd) {
@@ -953,11 +1141,17 @@ class CiteDB extends siyuan.Plugin {
       return !before[id];
     });
 
-    const attrs2 = { [ATTR_REFS]: JSON.stringify(kept) };
+    const attrs2 = { [ATTR_REFS]: JSON.stringify(keptR), [ATTR_NOTES]: JSON.stringify(keptN) };
     if (madeIDs.length) attrs2[ATTR_BIB] = madeIDs.join(",");
     await this.api("/api/attr/setBlockAttrs", { id: docID, attrs: attrs2 });
-    if (!silent) siyuan.showMessage("参考文献已更新（" + kept.length + " 条，编号已重排）", 3000);
+    if (!silent) {
+      const parts = [];
+      if (keptN.length) parts.push("注 " + keptN.length + " 条");
+      if (keptR.length) parts.push("参考文献 " + keptR.length + " 条");
+      siyuan.showMessage("已更新（" + parts.join("、") + "，编号已重排）", 3000);
+    }
   }
+
 }
 
 module.exports = CiteDB;
