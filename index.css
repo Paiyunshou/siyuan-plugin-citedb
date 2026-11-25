@@ -1,41 +1,59 @@
-/* 引注 CiteDB — panel styles */
+/* 引注 CiteDB — 面板与搜索框样式（跟随思源主题变量） */
 .citeDB-panel .citeDB-row {
   display: flex;
   justify-content: space-between;
-  padding: 2px 0 8px;
+  padding: 2px 0 10px;
   font-size: 13px;
-  opacity: 0.85;
+  opacity: .85;
 }
-.citeDB-panel .citeDB-label { opacity: 0.7; }
-.citeDB-panel .citeDB-sources { margin: 8px 0 14px; }
-.citeDB-panel .citeDB-source {
-  list-style: none;
-  padding: 8px 10px;
-  border: 1px solid var(--b3-border-color);
-  border-radius: 6px;
-  margin-bottom: 6px;
-  font-size: 13px;
+.citeDB-panel .citeDB-label { opacity: .6; }
+.citeDB-panel .citeDB-value { font-variant-numeric: tabular-nums; }
+
+.citeDB-table { width: 100%; border-collapse: collapse; font-size: 13px; margin-bottom: 6px; }
+.citeDB-table th {
+  text-align: left; font-weight: 500; opacity: .6; font-size: 12px;
+  padding: 0 6px 6px 0; border-bottom: 1px solid var(--b3-border-color);
 }
-.citeDB-panel .citeDB-source span { display: block; opacity: 0.6; font-size: 12px; margin-top: 2px; }
-.citeDB-panel .citeDB-empty {
-  padding: 16px;
-  border: 1px dashed var(--b3-border-color);
-  border-radius: 8px;
-  text-align: center;
+.citeDB-table td { padding: 8px 6px 8px 0; border-bottom: 1px solid var(--b3-border-color); }
+.citeDB-table tr:last-child td { border-bottom: 0; }
+.citeDB-link { color: var(--b3-theme-primary); cursor: pointer; font-size: 12px; }
+.citeDB-link:hover { text-decoration: underline; }
+
+.citeDB-actions { display: flex; align-items: center; gap: 8px; margin-top: 14px; flex-wrap: wrap; }
+.citeDB-actions .b3-button { margin: 0; }
+
+.citeDB-tip { font-size: 12px; opacity: .6; margin-top: 10px; line-height: 1.6; }
+.citeDB-tip code {
+  background: var(--b3-theme-surface-lighter); border-radius: 3px;
+  padding: 1px 5px; font-size: 12px;
 }
-.citeDB-panel .citeDB-empty-title { font-weight: 600; margin-bottom: 6px; }
-.citeDB-panel .citeDB-empty-hint { font-size: 12px; opacity: 0.65; line-height: 1.6; }
-.citeDB-panel .citeDB-actions {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
+
+.citeDB-empty {
+  border: 1px dashed var(--b3-border-color); border-radius: 8px;
+  padding: 18px 16px; margin: 4px 0 10px; text-align: center;
 }
-.citeDB-panel .citeDB-wip { font-size: 12px; opacity: 0.55; }
-.citeDB-panel .citeDB-footer {
-  margin-top: 14px;
-  padding-top: 10px;
+.citeDB-empty-title { font-size: 14px; margin-bottom: 6px; }
+.citeDB-empty-hint { font-size: 12px; opacity: .6; line-height: 1.7; }
+
+.citeDB-field { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+.citeDB-field label { flex: 0 0 132px; font-size: 13px; opacity: .75; }
+.citeDB-field select, .citeDB-field input { flex: 1; min-width: 0; }
+.citeDB-map {
+  max-height: 300px; overflow: auto; padding: 4px 2px;
+  border-top: 1px solid var(--b3-border-color); margin-top: 10px;
+}
+
+.citeDB-search .citeDB-bar { display: flex; gap: 8px; margin-bottom: 8px; }
+.citeDB-search .citeDB-bar select { flex: 0 0 150px; }
+.citeDB-search .citeDB-bar input { flex: 1; }
+.citeDB-results {
+  max-height: 380px; overflow: auto; margin-top: 4px;
   border-top: 1px solid var(--b3-border-color);
-  font-size: 12px;
-  opacity: 0.7;
 }
+.citeDB-item {
+  padding: 8px 10px; border-radius: 6px; cursor: pointer;
+  border-bottom: 1px solid var(--b3-border-color);
+}
+.citeDB-item:hover, .citeDB-item--first { background: var(--b3-theme-surface-lighter); }
+.citeDB-item-title { font-size: 13.5px; line-height: 1.5; }
+.citeDB-item-sub { font-size: 12px; opacity: .55; margin-top: 2px; }

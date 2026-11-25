@@ -1,12 +1,8 @@
 {
   "topbarTip": "引注（从数据库插入引用）",
   "panelTitle": "引注 CiteDB",
-  "statusNoSource": "尚未配置数据源",
-  "statusHint": "请在设置中指定：数据库（属性视图）+ 字段映射 + 引文模板。",
-  "openSettings": "打开设置",
-  "insert": "插入引注",
-  "refresh": "刷新参考文献",
-  "wip": "引注功能开发中（L1）",
-  "version": "版本",
-  "openPanel": "打开引注面板"
+  "openPanel": "打开引注面板",
+  "openSearch": "插入引注",
+  "refreshBib": "刷新参考文献",
+  "version": "版本"
 }
