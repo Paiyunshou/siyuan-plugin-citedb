@@ -15,16 +15,16 @@
   ],
   "disabledInPublish": false,
   "displayName": {
-    "default": "CiteDB",
-    "zh-CN": "引注 CiteDB"
+    "en_US": "CiteDB",
+    "zh_CN": "引注 CiteDB"
   },
   "description": {
-    "default": "Insert citations from your SiYuan databases and auto-build a reference list",
-    "zh-CN": "从思源数据库插入引注，文末自动生成参考文献/法规法条"
+    "en_US": "Insert citations from your SiYuan databases and auto-build a reference list",
+    "zh_CN": "从思源数据库插入引注，文末自动生成参考文献/法规法条"
   },
   "readme": {
-    "default": "README.md",
-    "zh-CN": "README.zh-CN.md"
+    "en_US": "README.md",
+    "zh_CN": "README_zh_CN.md"
   },
   "icon": "icon.png",
   "preview": "preview.png",
