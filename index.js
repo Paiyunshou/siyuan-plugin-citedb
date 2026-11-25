@@ -492,11 +492,26 @@ class CiteDB extends siyuan.Plugin {
 
     srcSel.addEventListener("change", function () { self.safe(loadRows); });
     kw.addEventListener("input", function () { render(kw.value.trim()); });
+    const srcOf = function () { return sources[Number(srcSel.value)]; };
+    const insertFirst = function () {
+      const first = box.querySelector(".citeDB-item");
+      if (first) first.click();
+    };
     kw.addEventListener("keydown", function (e) {
+      if (e.key !== "Enter") return;
+      e.preventDefault();
+      /* 法规：先让用户填第几条，再回车插入，不然永远只插到法规名 */
+      if (srcOf().kind === "law" && !art.value.trim()) {
+        art.focus();
+        art.placeholder = "填第几条（如 五 或 5），可留空；再按回车插入";
+        return;
+      }
+      insertFirst();
+    });
+    art.addEventListener("keydown", function (e) {
       if (e.key === "Enter") {
         e.preventDefault();
-        const first = box.querySelector(".citeDB-item");
-        if (first) first.click();
+        insertFirst();
       }
     });
     await loadRows();
@@ -532,6 +547,7 @@ class CiteDB extends siyuan.Plugin {
 
   /** 找到「往哪里插」：优先用 protyle，退化到 DOM 里当前打开的文档标题块 */
   resolveTarget(protyle) {
+    const self = this;
     const p = protyle || this.lastProtyle;
     if (p && p.block && p.block.rootID) {
       return {
@@ -539,7 +555,7 @@ class CiteDB extends siyuan.Plugin {
         insert: function (md, html) {
           if (typeof p.insert === "function") p.insert(md);
           else if (typeof p.insertHTML === "function") p.insertHTML(html);
-          else throw new Error("当前版本不支持直接插入，请手动粘贴：" + md);
+          else self.insertAtCaret(html);
         },
       };
     }
@@ -572,51 +588,125 @@ class CiteDB extends siyuan.Plugin {
       refs.push(hit);
       await this.api("/api/attr/setBlockAttrs", { id: docID, attrs: { [ATTR_REFS]: JSON.stringify(refs) } });
     }
-    const md = row.linked ? "[" + hit.n + "](siyuan://blocks/" + row.docID + ")" : "[" + hit.n + "]";
+    /* 有链接的用思源原生块引写法 ((id "[n]"))，锚文本带方括号，显示和纯编号一致 */
+    const md = row.linked ? '((' + row.docID + ' "[' + hit.n + ']"))' : "[" + hit.n + "]";
     const html = row.linked
-      ? '<span data-type="block-ref" data-id="' + row.docID + '" data-subtype="s">' + hit.n + "</span>"
+      ? '<span data-type="block-ref" data-id="' + row.docID + '" data-subtype="s">[' + hit.n + "]</span>"
       : "[" + hit.n + "]";
     target.insert(md, html);
     siyuan.showMessage("已插入 [" + hit.n + "]：" + text, 3000);
   }
 
   /* ---------------- 文末参考文献 ---------------- */
+  /** 找出这篇文档里由本插件生成的参考文献块（标题 + 每一条） */
+  async bibBlocks(docID) {
+    /* 标题块的 type 是 'h'（级别在 subtype 里），不是 h4 —— 之前写成 h4 永远匹配不到，
+       标题删不掉，越刷新越多 */
+    const rows =
+      (await this.api("/api/query/sql", {
+        stmt:
+          "SELECT id, type, content FROM blocks WHERE root_id = '" + docID + "' AND (type = 'h' OR type = 'p')",
+      })) || [];
+    const out = [];
+    rows.forEach(function (r) {
+      const c = (r.content || "").trim();
+      if (r.type === "h" && c === "参考文献") out.push(r.id);
+      else if (r.type === "p" && /^\[\d+\]\s*见/.test(c)) out.push(r.id);
+    });
+    return out;
+  }
+
   async refreshBib(protyle) {
     const docID = this.resolveTarget(protyle).docID;
     const attrs = (await this.api("/api/attr/getBlockAttrs", { id: docID })) || {};
     let refs = [];
-    try { refs = JSON.parse(attrs[ATTR_REFS] || "[]"); } catch (e) { refs = []; }
-    if (!refs.length) {
-      siyuan.showMessage("这篇文档还没有引用", 3000);
+    try {
+      refs = JSON.parse(attrs[ATTR_REFS] || "[]");
+    } catch (e) {
+      refs = [];
+    }
+
+    /* 1. 先清干净旧的参考文献块（一块一块删，光删标题会留下每条正文，越刷越多）。
+       上次生成时的块 id 存在属性里：SQL 索引是异步更新的，刚追加的块查不到，只能靠这个。 */
+    const tracked = String(attrs[ATTR_BIB] || "")
+      .split(",")
+      .map(function (x) {
+        return x.trim();
+      })
+      .filter(Boolean);
+    const olds = tracked.slice();
+    (await this.bibBlocks(docID)).forEach(function (id) {
+      if (olds.indexOf(id) < 0) olds.push(id);
+    });
+    for (let k = 0; k < olds.length; k++) {
+      try {
+        await this.api("/api/block/deleteBlock", { id: olds[k] });
+      } catch (e) {
+        console.warn("[citedb] 删除旧参考文献块失败", olds[k], e);
+      }
+    }
+
+    /* 2. 以正文为准：正文里没有的编号就丢掉（删了 [1] 就该消失） */
+    const kd = ((await this.api("/api/block/getBlockKramdown", { id: docID })) || {}).kramdown || "";
+    const body = kd.split(/\n####\s*参考文献/)[0];
+    const present = {};
+    /* 思源会把插进去的块引规范成 ((id "5"))，锚文本不一定带方括号，两种都要认 */
+    body.replace(/\(\((\S+)\s+"\[?(\d+)\]?"\)\)/g, function (m, id, n) {
+      present[n] = present[n] || { docId: id };
+      return m;
+    });
+    body.replace(/\[(\d+)\]\(siyuan:\/\/blocks\/([^\s)]+)\)/g, function (m, n, id) {
+      present[n] = present[n] || { docId: id };
+      return m;
+    });
+    body.replace(/\[(\d+)\](?!\()/g, function (m, n) {
+      present[n] = present[n] || {};
+      return m;
+    });
+    const kept = refs
+      .filter(function (r) {
+        return present[String(r.n)];
+      })
+      .sort(function (a, b) {
+        return a.n - b.n;
+      });
+
+    if (!kept.length) {
+      await this.api("/api/attr/setBlockAttrs", { id: docID, attrs: { [ATTR_REFS]: "[]", [ATTR_BIB]: "" } });
+      siyuan.showMessage("正文里没有引用了，参考文献已清空", 3000);
       return;
     }
-    refs.sort(function (a, b) { return a.n - b.n; });
-    const old = attrs[ATTR_BIB];
-    if (old) {
-      try { await this.api("/api/block/deleteBlock", { id: old }); } catch (e) { /* 已不存在 */ }
-    }
+
+    /* 3. 重新生成一份 */
     let md = "#### 参考文献\n\n";
-    refs.forEach(function (r) {
-      const body = r.linked && r.docId ? "[" + r.text + "](siyuan://blocks/" + r.docId + ")" : r.text;
-      md += "[" + r.n + "] " + body + "\n\n";
+    kept.forEach(function (r) {
+      const body2 = r.linked && r.docId ? "[" + r.text + "](siyuan://blocks/" + r.docId + ")" : r.text;
+      md += "[" + r.n + "] " + body2 + "\n\n";
     });
     const ret = await this.api("/api/block/appendBlock", { parentID: docID, dataType: "markdown", data: md.trim() });
     let bibID = "";
-    if (typeof ret === "string") bibID = ret;
-    else if (Array.isArray(ret)) {
-      const ops = (ret[0] && ret[0].doOperations) || [];
-      const op = ops.find(function (o) { return o && o.id && (o.action === "insert" || !o.action); });
-      if (op) bibID = op.id;
-      else if (ops[0] && ops[0].id) bibID = ops[0].id;
-    } else if (ret && typeof ret.id === "string") bibID = ret.id;
+    const madeIDs = [];
+    if (Array.isArray(ret)) {
+      ((ret[0] && ret[0].doOperations) || []).forEach(function (o) {
+        if (o && o.id) madeIDs.push(o.id);
+      });
+      if (madeIDs.length) bibID = madeIDs[0];
+    } else if (ret && typeof ret.id === "string") {
+      bibID = ret.id;
+      madeIDs.push(ret.id);
+    }
     if (!bibID) {
       const found = await this.api("/api/query/sql", {
-        stmt: "SELECT id FROM blocks WHERE root_id = '" + docID + "' AND type = 'h4' AND content = '参考文献' ORDER BY created DESC LIMIT 1",
+        stmt:
+          "SELECT id FROM blocks WHERE root_id = '" + docID + "' AND type = 'h4' AND content = '参考文献' ORDER BY created DESC LIMIT 1",
       });
       if (found && found[0]) bibID = found[0].id;
     }
-    if (bibID) await this.api("/api/attr/setBlockAttrs", { id: docID, attrs: { [ATTR_BIB]: bibID } });
-    siyuan.showMessage("参考文献已更新（" + refs.length + " 条）", 3000);
+    const attrs2 = { [ATTR_REFS]: JSON.stringify(kept) };
+    const bibList = madeIDs.length ? madeIDs.join(",") : bibID;
+    if (bibList) attrs2[ATTR_BIB] = bibList;
+    await this.api("/api/attr/setBlockAttrs", { id: docID, attrs: attrs2 });
+    siyuan.showMessage("参考文献已更新（" + kept.length + " 条，旧的已替换）", 3000);
   }
 }
 
