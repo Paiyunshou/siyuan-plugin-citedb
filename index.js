@@ -108,6 +108,26 @@ function avColumns(view) {
   });
 }
 
+/** 法规标题里常自带文号（「…的通知（财税〔2009〕59号）」），剔掉，免得引注里出现两遍 */
+function cleanLawTitle(title, wenhao) {
+  let t = String(title || "");
+  if (!wenhao) return t.trim();
+  const norm = function (x) {
+    return String(x || "").replace(/[\s（）()〔〕\[\]【】《》、，,.。·]/g, "");
+  };
+  const nw = norm(wenhao);
+  if (!nw) return t.trim();
+  /* 1. 整段带括号的直接删 */
+  [["（", "）"], ["(", ")"], ["【", "】"], ["[", "]"]].forEach(function (pair) {
+    t = t.split(pair[0] + wenhao + pair[1]).join("");
+  });
+  /* 2. 括号段规范化后与文号相同的删掉（兼容全角/半角、空格差异） */
+  t = t.replace(/[（(【\[]([^（()）【】\[\]]{2,60})[）)】\]]/g, function (m, inner) {
+    return norm(inner) === nw ? "" : m;
+  });
+  return t.replace(/\s{2,}/g, " ").trim();
+}
+
 /** 生成一条引注文字 */
 function citeText(src, cells, article) {
   const g = function (role) {
@@ -117,11 +137,12 @@ function citeText(src, cells, article) {
   const title = g("title");
   if (!title) return "见（缺题名）";
   if (src.kind === "law") {
-    let s = "《" + title + "》";
     const wenhao = g("wenhao");
-    if (wenhao) s += "（" + wenhao + "）";
-    if (article) s += "第" + article + "条";
-    return "见" + s + "。";
+    const s = "《" + cleanLawTitle(title, wenhao) + "》";
+    let out = s;
+    if (wenhao) out += "（" + wenhao + "）";
+    if (article) out += "第" + article + "条";
+    return "见" + out + "。";
   }
   const parts = [];
   const author = g("author");
@@ -424,7 +445,8 @@ class CiteDB extends siyuan.Plugin {
       "</div>" +
       '<div class="citeDB-bar" id="citeDB-extra" style="display:none">' +
       '<span class="citeDB-law">第</span>' +
-      '<input id="citeDB-art" class="b3-text-field" placeholder="条号，如 五 或 5（可留空）">' +
+      '<input id="citeDB-art" class="b3-text-field" list="citeDB-artlist" placeholder="点这里选，或直接输入，如 五">' +
+      '<datalist id="citeDB-artlist"></datalist>' +
       '<span class="citeDB-law">条</span>' +
       '<button id="citeDB-go" class="b3-button b3-button--outline">插入</button></div>' +
       '<div class="citeDB-results" id="citeDB-results"><div class="citeDB-tip">输入关键词开始搜索</div></div>' +
@@ -438,12 +460,40 @@ class CiteDB extends siyuan.Plugin {
     const extra = root.querySelector("#citeDB-extra");
     const goBtn = root.querySelector("#citeDB-go");
     const hint = root.querySelector("#citeDB-hint");
+    const artList = root.querySelector("#citeDB-artlist");
     const box = root.querySelector("#citeDB-results");
     let rows = [];
     let pending = null;
 
     const srcOf = function () {
       return sources[Number(srcSel.value)];
+    };
+
+    /** 选中法规后，把这篇文章里出现的「第X条」抓出来做下拉候选 */
+    const loadArticles = async function (row) {
+      artList.innerHTML = "";
+      if (!row || !row.docID) return 0;
+      try {
+        const kd = ((await self.api("/api/block/getBlockKramdown", { id: row.docID })) || {}).kramdown || "";
+        const seen = {};
+        const list = [];
+        const re = /第([一二三四五六七八九十百千零〇\d]{1,8})条/g;
+        let m;
+        while ((m = re.exec(kd))) {
+          if (!seen[m[1]]) {
+            seen[m[1]] = 1;
+            list.push(m[1]);
+          }
+        }
+        artList.innerHTML = list
+          .map(function (n2) {
+            return '<option value="' + n2 + '">第' + n2 + "条</option>";
+          })
+          .join("");
+        return list.length;
+      } catch (e) {
+        return 0;
+      }
     };
 
     const insertRow = function (row) {
@@ -460,6 +510,7 @@ class CiteDB extends siyuan.Plugin {
       extra.style.display = isLaw ? "" : "none";
       kw.placeholder = isLaw ? "输入法规关键词，回车选中" : "输入关键词，回车插入";
       pending = null;
+      if (artList) artList.innerHTML = "";
       box.innerHTML = '<div class="citeDB-tip">读取中…</div>';
       const avID = await self.resolveAv(src.avID);
       const view = (await self.api("/api/av/renderAttributeView", { id: avID, pageSize: 1000, page: 1 })).view;
@@ -500,7 +551,9 @@ class CiteDB extends siyuan.Plugin {
           '<div class="citeDB-item' + (i === 0 ? " citeDB-item--first" : "") +
           (pending && rows.indexOf(pending) === idx ? " citeDB-item--picked" : "") +
           '" data-i="' + idx + '">' +
-          '<div class="citeDB-item-title">' + esc(r.title) + "</div>" +
+          '<div class="citeDB-item-title">' +
+          esc(src.kind === "law" ? cleanLawTitle(r.title, r.cells[src.map.wenhao]) : r.title) +
+          "</div>" +
           '<div class="citeDB-item-sub">' + esc(sub) + "</div></div>";
       });
       box.innerHTML = h;
@@ -508,12 +561,19 @@ class CiteDB extends siyuan.Plugin {
         el.addEventListener("click", function () {
           const row = rows[Number(el.getAttribute("data-i"))];
           if (srcOf().kind === "law" && !art.value.trim()) {
-            /* 法规：先选中，再让用户填第几条，最后按「插入」或回车 */
+            /* 法规：先选中，再让用户选/填第几条，最后按「插入」或回车 */
             pending = row;
             render(kw.value.trim());
             art.value = "";
             art.focus();
-            hint.textContent = "已选《" + String(row.title).slice(0, 30) + "》：填第几条（可留空），再按回车或「插入」。";
+            hint.textContent = "已选《" + String(row.title).slice(0, 30) + "》：正在读条款…";
+            self.safe(async function () {
+              const cnt = await loadArticles(row);
+              hint.textContent =
+                "已选《" + String(row.title).slice(0, 26) + "》：" +
+                (cnt ? "这篇有 " + cnt + " 条可选（点输入框下拉），" : "") +
+                "可留空，再按回车或「插入」。";
+            });
             return;
           }
           insertRow(row);
@@ -538,7 +598,14 @@ class CiteDB extends siyuan.Plugin {
         render(kw.value.trim());
         art.value = "";
         art.focus();
-        hint.textContent = "已选《" + String(row.title).slice(0, 30) + "》：填第几条（可留空），再按回车或「插入」。";
+        hint.textContent = "已选《" + String(row.title).slice(0, 30) + "》：正在读条款…";
+        self.safe(async function () {
+          const cnt = await loadArticles(row);
+          hint.textContent =
+            "已选《" + String(row.title).slice(0, 26) + "》：" +
+            (cnt ? "这篇有 " + cnt + " 条可选（点输入框下拉），" : "") +
+            "可留空，再按回车或「插入」。";
+        });
         return;
       }
       insertRow(firstRow());
