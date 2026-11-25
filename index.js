@@ -595,9 +595,156 @@ class CiteDB extends siyuan.Plugin {
       : "[" + hit.n + "]";
     target.insert(md, html);
     siyuan.showMessage("已插入 [" + hit.n + "]：" + text, 3000);
+    /* 文末已经有参考文献的，插入后把编号和列表同步一次（没有就先不管，等用户刷新） */
+    const self2 = this;
+    try {
+      const a = (await this.api("/api/attr/getBlockAttrs", { id: docID })) || {};
+      if (a[ATTR_BIB]) {
+        setTimeout(function () {
+          self2.safe(function () {
+            return self2.refreshBib({ block: { rootID: docID } }, true);
+          });
+        }, 700);
+      }
+    } catch (e) {
+      /* 同步失败不影响插入 */
+    }
+  }
+
+  /* ---------------- 编号重排 ---------------- */
+
+  /** 把文档 kramdown 拆成 [{id, md}]（保持文档顺序） */
+  splitBlocks(kd) {
+    const out = [];
+    const lines = String(kd || "").split("\n");
+    let buf = [];
+    for (let i = 0; i < lines.length; i++) {
+      const m = /^\{: id="([^"]+)"[^}]*\}$/.exec(lines[i].trim());
+      if (m) {
+        out.push({ id: m[1], md: buf.join("\n").trim() });
+        buf = [];
+      } else {
+        buf.push(lines[i]);
+      }
+    }
+    return out;
+  }
+
+  /** 正文引用标记的三种写法：((id "[n]"))、[n](siyuan://blocks/id)、[n] */
+  static get MARKER() {
+    return /\(\((\S+?)\s+"\[?(\d+)\]?"\)\)|\[(\d+)\]\(siyuan:\/\/blocks\/([^\s)]+)\)|\[(\d+)\](?!\()/g;
+  }
+
+  /** 按正文出现顺序重排编号（同一条文献复用同一个号），并把新编号写回正文。
+   *  只处理「段落 p / 标题 h」两种块：列表项的文字其实在它的 p 子块里，
+   *  直接对列表块写回会把兄弟块的属性带进去，思源会报 block ID already exists。 */
+  async renumber(docID) {
+    const kd = ((await this.api("/api/block/getBlockKramdown", { id: docID })) || {}).kramdown || "";
+    let refs = [];
+    try {
+      refs = JSON.parse(((await this.api("/api/attr/getBlockAttrs", { id: docID })) || {})[ATTR_REFS] || "[]");
+    } catch (e) {
+      refs = [];
+    }
+    const byN = {};
+    refs.forEach(function (r) {
+      byN[r.n] = r;
+    });
+    const bibIDs = {};
+    (await this.bibBlocks(docID)).forEach(function (id) {
+      bibIDs[id] = 1;
+    });
+
+    /* 块的先后顺序：直接用 kramdown 里 { ial } 出现的次序（内联的也算） */
+    const order = [];
+    const seenID = {};
+    const reID = /\{: id="([^"]+)"/g;
+    let m;
+    while ((m = reID.exec(kd))) {
+      if (!seenID[m[1]]) {
+        seenID[m[1]] = 1;
+        order.push(m[1]);
+      }
+    }
+    const rows =
+      (await this.api("/api/query/sql", {
+        stmt: "SELECT id, type FROM blocks WHERE root_id = '" + docID + "'",
+      })) || [];
+    const typeOf = {};
+    rows.forEach(function (r) {
+      typeOf[r.id] = r.type;
+    });
+
+    const assigned = {};
+    const out = [];
+    const changed = [];
+    let next = 0;
+    for (let k = 0; k < order.length; k++) {
+      const id = order[k];
+      if (id === docID || bibIDs[id]) continue;
+      const t = typeOf[id];
+      if (t !== "p" && t !== "h") continue;
+      let one = "";
+      try {
+        one = ((await this.api("/api/block/getBlockKramdown", { id: id })) || {}).kramdown || "";
+      } catch (e) {
+        continue;
+      }
+      const clean = one.replace(/\{:[^}]*\}/g, "").trim();
+      if (!clean) continue;
+      let touched = false;
+      const md = clean.replace(CiteDB.MARKER, function (whole, refId, n1, n2, linkId, n3) {
+        const docId = refId || linkId || "";
+        const oldN = Number(refId ? n1 : n2 || n3);
+        const key = docId || "#" + oldN;
+        if (!assigned[key]) {
+          next += 1;
+          let base = null;
+          if (docId) {
+            for (let q = 0; q < refs.length; q++) {
+              if (refs[q].docId === docId) {
+                base = refs[q];
+                break;
+              }
+            }
+          }
+          if (!base) base = byN[oldN] || null;
+          const entry = base
+            ? JSON.parse(JSON.stringify(base))
+            : { docId: "", rowID: "", linked: false, article: "", text: "", src: "" };
+          entry.n = next;
+          if (docId) entry.docId = docId;
+          entry.linked = !!entry.docId;
+          out.push(entry);
+          assigned[key] = next;
+        }
+        const n = assigned[key];
+        const repl = docId ? "((" + docId + ' "[' + n + ']"))' : "[" + n + "]";
+        if (repl !== whole) touched = true;
+        return repl;
+      });
+      if (touched) changed.push({ id: id, md: md });
+    }
+
+    let failed = 0;
+    for (let k = 0; k < changed.length; k++) {
+      try {
+        await this.api("/api/block/updateBlock", {
+          id: changed[k].id,
+          dataType: "markdown",
+          data: changed[k].md,
+        });
+      } catch (e) {
+        failed += 1;
+        console.warn("[citedb] 重排写回失败", changed[k].id, e);
+      }
+    }
+    if (failed) throw new Error("正文编号有 " + failed + " 处没改成，参考文献没有动，可再点一次刷新");
+    return { refs: out, changed: changed.length };
   }
 
   /* ---------------- 文末参考文献 ---------------- */
+
   /** 找出这篇文档里由本插件生成的参考文献块（标题 + 每一条） */
   async bibBlocks(docID) {
     /* 标题块的 type 是 'h'（级别在 subtype 里），不是 h4 —— 之前写成 h4 永远匹配不到，
@@ -611,23 +758,17 @@ class CiteDB extends siyuan.Plugin {
     rows.forEach(function (r) {
       const c = (r.content || "").trim();
       if (r.type === "h" && c === "参考文献") out.push(r.id);
-      else if (r.type === "p" && /^\[\d+\]\s*见/.test(c)) out.push(r.id);
+      else if (r.type === "p" && /^\[\d+\]\s*(见|\[)/.test(c)) out.push(r.id);
     });
     return out;
   }
 
-  async refreshBib(protyle) {
+  async refreshBib(protyle, silent) {
     const docID = this.resolveTarget(protyle).docID;
     const attrs = (await this.api("/api/attr/getBlockAttrs", { id: docID })) || {};
-    let refs = [];
-    try {
-      refs = JSON.parse(attrs[ATTR_REFS] || "[]");
-    } catch (e) {
-      refs = [];
-    }
 
-    /* 1. 先清干净旧的参考文献块（一块一块删，光删标题会留下每条正文，越刷越多）。
-       上次生成时的块 id 存在属性里：SQL 索引是异步更新的，刚追加的块查不到，只能靠这个。 */
+    /* 1. 先删干净旧的参考文献块。上次生成时的块 id 存在属性里（SQL 索引是异步的，
+       刚追加的块查不到），再按内容兜底扫一遍。 */
     const tracked = String(attrs[ATTR_BIB] || "")
       .split(",")
       .map(function (x) {
@@ -642,71 +783,49 @@ class CiteDB extends siyuan.Plugin {
       try {
         await this.api("/api/block/deleteBlock", { id: olds[k] });
       } catch (e) {
-        console.warn("[citedb] 删除旧参考文献块失败", olds[k], e);
+        /* 已经不存在（tree not found）属正常，忽略 */
+        if (String(e && e.message).indexOf("tree not found") < 0) console.warn("[citedb] 删除旧参考文献块失败", olds[k], e);
       }
     }
 
-    /* 2. 以正文为准：正文里没有的编号就丢掉（删了 [1] 就该消失） */
-    const kd = ((await this.api("/api/block/getBlockKramdown", { id: docID })) || {}).kramdown || "";
-    const body = kd.split(/\n####\s*参考文献/)[0];
-    const present = {};
-    /* 思源会把插进去的块引规范成 ((id "5"))，锚文本不一定带方括号，两种都要认 */
-    body.replace(/\(\((\S+)\s+"\[?(\d+)\]?"\)\)/g, function (m, id, n) {
-      present[n] = present[n] || { docId: id };
-      return m;
+    /* 2. 按正文重新编号（删掉中间的引用，后面的自动往前补；同一条文献复用一个号） */
+    const re = await this.renumber(docID);
+    const kept = re.refs.filter(function (r) {
+      return r.text;
     });
-    body.replace(/\[(\d+)\]\(siyuan:\/\/blocks\/([^\s)]+)\)/g, function (m, n, id) {
-      present[n] = present[n] || { docId: id };
-      return m;
-    });
-    body.replace(/\[(\d+)\](?!\()/g, function (m, n) {
-      present[n] = present[n] || {};
-      return m;
-    });
-    const kept = refs
-      .filter(function (r) {
-        return present[String(r.n)];
-      })
-      .sort(function (a, b) {
-        return a.n - b.n;
-      });
 
     if (!kept.length) {
       await this.api("/api/attr/setBlockAttrs", { id: docID, attrs: { [ATTR_REFS]: "[]", [ATTR_BIB]: "" } });
-      siyuan.showMessage("正文里没有引用了，参考文献已清空", 3000);
+      if (!silent) siyuan.showMessage("正文里没有引用了，参考文献已清空", 3000);
       return;
     }
 
-    /* 3. 重新生成一份 */
+    /* 3. 生成新的参考文献；块 id 用追加前后 kramdown 的差集拿，可靠（appendBlock 返回的
+       doOperations 不一定是全部新建块） */
+    const kdBefore = ((await this.api("/api/block/getBlockKramdown", { id: docID })) || {}).kramdown || "";
     let md = "#### 参考文献\n\n";
     kept.forEach(function (r) {
-      const body2 = r.linked && r.docId ? "[" + r.text + "](siyuan://blocks/" + r.docId + ")" : r.text;
-      md += "[" + r.n + "] " + body2 + "\n\n";
+      const body = r.linked && r.docId ? "[" + r.text + "](siyuan://blocks/" + r.docId + ")" : r.text;
+      md += "[" + r.n + "] " + body + "\n\n";
     });
-    const ret = await this.api("/api/block/appendBlock", { parentID: docID, dataType: "markdown", data: md.trim() });
-    let bibID = "";
-    const madeIDs = [];
-    if (Array.isArray(ret)) {
-      ((ret[0] && ret[0].doOperations) || []).forEach(function (o) {
-        if (o && o.id) madeIDs.push(o.id);
-      });
-      if (madeIDs.length) bibID = madeIDs[0];
-    } else if (ret && typeof ret.id === "string") {
-      bibID = ret.id;
-      madeIDs.push(ret.id);
-    }
-    if (!bibID) {
-      const found = await this.api("/api/query/sql", {
-        stmt:
-          "SELECT id FROM blocks WHERE root_id = '" + docID + "' AND type = 'h4' AND content = '参考文献' ORDER BY created DESC LIMIT 1",
-      });
-      if (found && found[0]) bibID = found[0].id;
-    }
+    await this.api("/api/block/appendBlock", { parentID: docID, dataType: "markdown", data: md.trim() });
+    const kdAfter = ((await this.api("/api/block/getBlockKramdown", { id: docID })) || {}).kramdown || "";
+    const idOf = function (kd) {
+      const set = {};
+      const re2 = /\{: id="([^"]+)"/g;
+      let m;
+      while ((m = re2.exec(kd))) set[m[1]] = 1;
+      return set;
+    };
+    const before = idOf(kdBefore);
+    const madeIDs = Object.keys(idOf(kdAfter)).filter(function (id) {
+      return !before[id];
+    });
+
     const attrs2 = { [ATTR_REFS]: JSON.stringify(kept) };
-    const bibList = madeIDs.length ? madeIDs.join(",") : bibID;
-    if (bibList) attrs2[ATTR_BIB] = bibList;
+    if (madeIDs.length) attrs2[ATTR_BIB] = madeIDs.join(",");
     await this.api("/api/attr/setBlockAttrs", { id: docID, attrs: attrs2 });
-    siyuan.showMessage("参考文献已更新（" + kept.length + " 条，旧的已替换）", 3000);
+    if (!silent) siyuan.showMessage("参考文献已更新（" + kept.length + " 条，编号已重排）", 3000);
   }
 }
 
