@@ -792,14 +792,13 @@ class CiteDB extends siyuan.Plugin {
     /* 文末已经有列表的，插入后把编号和列表同步一次（没有就先不管，等用户刷新） */
     const self2 = this;
     try {
-      const a = (await this.api("/api/attr/getBlockAttrs", { id: docID })) || {};
-      if (a[ATTR_BIB]) {
-        setTimeout(function () {
-          self2.safe(function () {
-            return self2.refreshBib({ block: { rootID: docID } }, true);
-          });
-        }, 700);
-      }
+      /* 插完就同步一次：文末还没有列表的（第一次插）也要立刻生出来，
+         否则法规的「注」不会出现 */
+      setTimeout(function () {
+        self2.safe(function () {
+          return self2.refreshBib({ block: { rootID: docID } }, true);
+        });
+      }, 700);
     } catch (e) {
       /* 同步失败不影响插入 */
     }
