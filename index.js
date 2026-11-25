@@ -244,7 +244,8 @@ function citeLaw(src, cells, article) {
   if (wenhao) out += "（" + wenhao + "）";
   const a = String(article || "").trim();
   if (a) out += "第" + a + "条";
-  return out + "。";
+  /* 尾注条目结尾不加句号（用户觉得多余），文中上标也不带标点 */
+  return out;
 }
 
 function citeText(src, cells, extra) {
