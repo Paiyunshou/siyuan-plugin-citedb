@@ -355,6 +355,32 @@ class CiteDB extends siyuan.Plugin {
    *  markdown 里：<div data-type="NodeAttributeView" data-av-id="...">）。传错会拿到一个
    *  自动新建的空壳（只有「主键/单选」两列），表现就是搜不到任何结果。
    */
+  /** 法规库某行没绑文档时，按标题在库里回查文档 id */
+  async findDocByTitle(title) {
+    const t = String(title || "").replace(/[《》]/g, "").trim();
+    if (t.length < 4) return "";
+    try {
+      const rows =
+        (await this.api("/api/query/sql", {
+          stmt: "SELECT id, content FROM blocks WHERE type = 'd' AND content LIKE '%" + t.replace(/'/g, "''") + "%' LIMIT 5",
+        })) || [];
+      if (rows.length === 1) return rows[0].id;
+      /* 多个命中就挑标题最像的（法规文档名一般以文号开头，正文名在后半段） */
+      let best = "";
+      let bestLen = 0;
+      rows.forEach(function (r) {
+        const c = String(r.content || "");
+        if (c.indexOf(t) >= 0 && (bestLen === 0 || c.length < bestLen)) {
+          best = r.id;
+          bestLen = c.length;
+        }
+      });
+      return best;
+    } catch (e) {
+      return "";
+    }
+  }
+
   async resolveAv(id) {
     try {
       const rows = await this.api("/api/query/sql", { stmt: "SELECT markdown FROM blocks WHERE id = '" + id + "'" });
@@ -777,6 +803,18 @@ class CiteDB extends siyuan.Plugin {
       hit.src = src.name;
       hit.text = text;
     }
+    /* 法规行理论上都绑了文档；万一没绑（或库结构变了），按标题回查一次，
+       否则插进去只有个圈号，既没有双链也不进尾注 */
+    if (isLaw && !row.linked) {
+      const found = await this.findDocByTitle(row.title || "");
+      if (found) {
+        row.docID = found;
+        row.linked = true;
+        hit.docId = found;
+        hit.linked = true;
+        hit.text = citeText(src, row.cells, key);
+      }
+    }
     await this.api("/api/attr/setBlockAttrs", { id: docID, attrs: { [ATTR]: JSON.stringify(list) } });
     const anchor = isLaw ? cir(hit.n) : "[" + hit.n + "]";
     /* 上标 + 思源原生块引：<sup>((id "[1]"))</sup> / <sup>((id "①"))</sup>
@@ -788,7 +826,7 @@ class CiteDB extends siyuan.Plugin {
       ? '<sup><span data-type="block-ref" data-id="' + row.docID + '" data-subtype="s">' + anchor + "</span></sup>"
       : "<sup>" + anchor + "</sup>";
     target.insert(md, html);
-    siyuan.showMessage("已插入 " + anchor + "：" + text, 3000);
+    siyuan.showMessage("已插入 " + anchor + (row.linked ? "" : "（纯文字，不能跳转）") + "：" + text, 3000);
     /* 文末已经有列表的，插入后把编号和列表同步一次（没有就先不管，等用户刷新） */
     const self2 = this;
     try {
@@ -833,7 +871,8 @@ class CiteDB extends siyuan.Plugin {
    *  直接对列表块写回会把兄弟块的属性带进去，思源会报 block ID already exists。 */
   /** 法规尾注的标记：((id "①")) */
   static get NOTE_MARKER() {
-    return new RegExp('\\(\\((\\S+?)\\s+"([' + CIRCLED_RANGE + '])"\\)\\)', "g");
+    /* 两种写法都认：块引 ((id "①"))，以及早期退化成的纯文字上标 <sup>①</sup>（好把它升回块引） */
+    return new RegExp('\\(\\((\\S+?)\\s+"([' + CIRCLED_RANGE + '])"\\)\\)|<sup>([\u2460-\u2473\u3251-\u325f\u32b1-\u32bf])</sup>', "g");
   }
 
   /** 按正文出现顺序重排编号，并把新编号写回正文。
@@ -947,7 +986,7 @@ class CiteDB extends siyuan.Plugin {
         }
         if (docId) entry.docId = docId;
         out.push(entry);
-        assigned[key] = entry.n;
+        assigned[key] = entry;
       }
       return assigned[key];
     };
@@ -971,18 +1010,23 @@ class CiteDB extends siyuan.Plugin {
       let md = clean.replace(CiteDB.MARKER, function (whole, refId, n1, n2, linkId, n3) {
         const docId = refId || linkId || "";
         const oldN = Number(refId ? n1 : n2 || n3);
-        const n = take("ref", docId, oldN);
-        if (!n) return whole;
-        const repl = docId ? "((" + docId + ' "[' + n + ']"))' : "[" + n + "]";
+        const e = take("ref", docId, oldN);
+        if (!e) return whole;
+        const n = e.n;
+        /* 只有条目自己绑了文档才做块引；文献库的书名格是段落，硬链接会打不开 */
+        const id2 = e.linked && e.docId ? e.docId : "";
+        const repl = id2 ? "((" + id2 + ' "[' + n + ']"))' : "[" + n + "]";
         if (repl !== whole) touched = true;
         return repl;
       });
 
       /* 第二遍：法规尾注 ① */
-      md = md.replace(CiteDB.NOTE_MARKER, function (whole, docId, ch) {
-        const n = take("note", docId, cirIndex(ch));
-        if (!n) return whole;
-        const repl = "((" + docId + ' "' + cir(n) + '"))';
+      md = md.replace(CiteDB.NOTE_MARKER, function (whole, docId, ch, plain) {
+        const mark = ch || plain || "";
+        const e = take("note", docId || "", cirIndex(mark));
+        if (!e) return whole;
+        const id2 = e.linked && e.docId ? e.docId : "";
+        const repl = id2 ? "((" + id2 + ' "' + cir(e.n) + '"))' : cir(e.n);
         if (repl !== whole) touched = true;
         return repl;
       });
