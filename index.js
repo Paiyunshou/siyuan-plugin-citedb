@@ -688,8 +688,14 @@ class CiteDB extends siyuan.Plugin {
       const n = refs.reduce(function (m, r) { return Math.max(m, r.n || 0); }, 0) + 1;
       hit = { n: n, docId: row.docID, rowID: row.rowID, linked: !!row.linked, article: article || "", text: text, src: src.name };
       refs.push(hit);
-      await this.api("/api/attr/setBlockAttrs", { id: docID, attrs: { [ATTR_REFS]: JSON.stringify(refs) } });
+    } else {
+      /* 这条以前引过：文字按这次的选择重写（法规名改过、文号清洗过都要跟上） */
+      hit.rowID = row.rowID;
+      hit.linked = !!row.linked;
+      hit.src = src.name;
+      hit.text = text;
     }
+    await this.api("/api/attr/setBlockAttrs", { id: docID, attrs: { [ATTR_REFS]: JSON.stringify(refs) } });
     /* 有链接的用思源原生块引写法 ((id "[n]"))，锚文本带方括号，显示和纯编号一致 */
     const md = row.linked ? '((' + row.docID + ' "[' + hit.n + ']"))' : "[" + hit.n + "]";
     const html = row.linked
@@ -895,6 +901,37 @@ class CiteDB extends siyuan.Plugin {
     const kept = re.refs.filter(function (r) {
       return r.text;
     });
+
+    /* 条目文字一律按库里最新数据重建：法规名改过、文号清洗过、旧条目是清洗前存的，都能自动更正 */
+    const srcByName = {};
+    ((this.data && this.data.sources) || []).forEach(function (x) {
+      srcByName[x.name] = x;
+    });
+    const rowCache = {};
+    for (let q = 0; q < kept.length; q++) {
+      const r = kept[q];
+      const src = srcByName[r.src];
+      if (!src || !r.docId) continue;
+      try {
+        if (!rowCache[src.name]) {
+          const av = await this.resolveAv(src.avID);
+          const view = (await this.api("/api/av/renderAttributeView", { id: av, pageSize: 1000, page: 1 })).view;
+          const cols2 = avColumns(view);
+          if (!(src.map && src.map.title && cols2.some(function (c) { return c.id === src.map.title; }))) {
+            src.map = guessMap(cols2);
+          }
+          rowCache[src.name] = avRows(view, src.map);
+        }
+        const row = rowCache[src.name].find(function (x) { return x.docID === r.docId; });
+        if (row) {
+          r.text = citeText(src, row.cells, r.article || "");
+          r.rowID = row.rowID;
+          r.linked = !!row.linked;
+        }
+      } catch (e) {
+        console.warn("[citedb] 重建条目文字失败", r.docId, e);
+      }
+    }
 
     if (!kept.length) {
       await this.api("/api/attr/setBlockAttrs", { id: docID, attrs: { [ATTR_REFS]: "[]", [ATTR_BIB]: "" } });
