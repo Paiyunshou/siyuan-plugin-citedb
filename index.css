@@ -1,0 +1,41 @@
+/* 引注 CiteDB — panel styles */
+.citeDB-panel .citeDB-row {
+  display: flex;
+  justify-content: space-between;
+  padding: 2px 0 8px;
+  font-size: 13px;
+  opacity: 0.85;
+}
+.citeDB-panel .citeDB-label { opacity: 0.7; }
+.citeDB-panel .citeDB-sources { margin: 8px 0 14px; }
+.citeDB-panel .citeDB-source {
+  list-style: none;
+  padding: 8px 10px;
+  border: 1px solid var(--b3-border-color);
+  border-radius: 6px;
+  margin-bottom: 6px;
+  font-size: 13px;
+}
+.citeDB-panel .citeDB-source span { display: block; opacity: 0.6; font-size: 12px; margin-top: 2px; }
+.citeDB-panel .citeDB-empty {
+  padding: 16px;
+  border: 1px dashed var(--b3-border-color);
+  border-radius: 8px;
+  text-align: center;
+}
+.citeDB-panel .citeDB-empty-title { font-weight: 600; margin-bottom: 6px; }
+.citeDB-panel .citeDB-empty-hint { font-size: 12px; opacity: 0.65; line-height: 1.6; }
+.citeDB-panel .citeDB-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.citeDB-panel .citeDB-wip { font-size: 12px; opacity: 0.55; }
+.citeDB-panel .citeDB-footer {
+  margin-top: 14px;
+  padding-top: 10px;
+  border-top: 1px solid var(--b3-border-color);
+  font-size: 12px;
+  opacity: 0.7;
+}

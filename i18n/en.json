@@ -1,0 +1,12 @@
+{
+  "topbarTip": "CiteDB — insert citation from a database",
+  "panelTitle": "CiteDB",
+  "statusNoSource": "No data source configured",
+  "statusHint": "Configure an attribute view, field mapping and citation template in settings.",
+  "openSettings": "Open settings",
+  "insert": "Insert citation",
+  "refresh": "Refresh bibliography",
+  "wip": "Citation insertion is under development (L1)",
+  "version": "Version",
+  "openPanel": "Open CiteDB panel"
+}

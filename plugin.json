@@ -1,0 +1,39 @@
+{
+  "name": "siyuan-plugin-citedb",
+  "author": "Paiyunshou",
+  "url": "https://github.com/Paiyunshou/siyuan-plugin-citedb",
+  "version": "0.1.0",
+  "minAppVersion": "3.1.13",
+  "kernels": [
+    "all"
+  ],
+  "backends": [
+    "all"
+  ],
+  "frontends": [
+    "all"
+  ],
+  "disabledInPublish": false,
+  "displayName": {
+    "default": "CiteDB",
+    "zh-CN": "引注 CiteDB"
+  },
+  "description": {
+    "default": "Insert citations from your SiYuan databases and auto-build a reference list",
+    "zh-CN": "从思源数据库插入引注，文末自动生成参考文献/法规法条"
+  },
+  "readme": {
+    "default": "README.md",
+    "zh-CN": "README.zh-CN.md"
+  },
+  "icon": "icon.png",
+  "preview": "preview.png",
+  "keywords": [
+    "引注",
+    "参考文献",
+    "法规",
+    "citation",
+    "reference",
+    "财税"
+  ]
+}
