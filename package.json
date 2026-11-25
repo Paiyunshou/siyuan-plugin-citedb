@@ -1,6 +1,6 @@
 {
   "name": "siyuan-plugin-citedb",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Insert citations from SiYuan databases (attribute views) and auto-build a bibliography.",
   "author": "Paiyunshou",
   "license": "MIT",

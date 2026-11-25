@@ -175,8 +175,16 @@ class CiteDB extends siyuan.Plugin {
     }
     try {
       const self = this;
-      this.eventBus.on("loaded-protyle-static", function (e) {
-        if (e && e.detail && e.detail.protyle) self.lastProtyle = e.detail.protyle;
+      const grab = function (e) {
+        const p = e && e.detail && e.detail.protyle;
+        if (p && p.block && p.block.rootID) self.lastProtyle = p;
+      };
+      ["click-editorcontent", "switch-protyle", "loaded-protyle-static", "loaded-protyle-dynamic"].forEach(function (name) {
+        try {
+          self.eventBus.on(name, grab);
+        } catch (err) {
+          console.warn("[citedb] 订阅 " + name + " 失败", err);
+        }
       });
     } catch (e) {
       console.warn("[citedb] eventBus 订阅失败", e);
@@ -398,6 +406,7 @@ class CiteDB extends siyuan.Plugin {
 
   /* ---------------- 搜索插入 ---------------- */
   async openSearch(protyle) {
+    this.lastCaret = this.captureCaret();
     const sources = this.config.sources || [];
     if (!sources.length) {
       siyuan.showMessage("请先在引注面板里添加数据源", 5000, "error");
@@ -494,11 +503,64 @@ class CiteDB extends siyuan.Plugin {
     setTimeout(function () { kw.focus(); }, 80);
   }
 
+  /** 打开对话框前把光标位置记下来：万一拿不到 protyle 实例，还能按这个位置插入 */
+  captureCaret() {
+    try {
+      const sel = window.getSelection();
+      if (!sel || !sel.rangeCount) return null;
+      let node = sel.anchorNode;
+      if (!node) return null;
+      const el = node.nodeType === 1 ? node : node.parentElement;
+      const wys = el && el.closest && el.closest(".protyle-wysiwyg");
+      if (!wys) return null;
+      return { wys: wys, range: sel.getRangeAt(0).cloneRange() };
+    } catch (e) {
+      return null;
+    }
+  }
+
+  insertAtCaret(html) {
+    const c = this.lastCaret;
+    if (!c || !c.wys || !document.contains(c.wys)) throw new Error("光标不在正文里：请先在正文点一下，或用 / 引注 插入");
+    c.wys.focus();
+    const sel = window.getSelection();
+    sel.removeAllRanges();
+    sel.addRange(c.range);
+    const ok = document.execCommand("insertHTML", false, html);
+    if (!ok) throw new Error("插入被拒绝：请用 / 引注 插入");
+  }
+
+  /** 找到「往哪里插」：优先用 protyle，退化到 DOM 里当前打开的文档标题块 */
+  resolveTarget(protyle) {
+    const p = protyle || this.lastProtyle;
+    if (p && p.block && p.block.rootID) {
+      return {
+        docID: p.block.rootID,
+        insert: function (md, html) {
+          if (typeof p.insert === "function") p.insert(md);
+          else if (typeof p.insertHTML === "function") p.insertHTML(html);
+          else throw new Error("当前版本不支持直接插入，请手动粘贴：" + md);
+        },
+      };
+    }
+    const title =
+      document.querySelector(".layout__wnd--active .protyle-title") || document.querySelector(".protyle-title");
+    if (title && title.getAttribute("data-node-id")) {
+      const self = this;
+      return {
+        docID: title.getAttribute("data-node-id"),
+        insert: function (md, html) {
+          self.insertAtCaret(html);
+        },
+      };
+    }
+    throw new Error("没找到正在编辑的文档：请把光标停在正文里，输入 / 选「引注」");
+  }
+
   /* ---------------- 插入 ---------------- */
   async doInsert(protyle, src, row, article) {
-    const p = protyle || this.lastProtyle;
-    if (!p || !p.block) throw new Error("请先点进要插入引用的文档");
-    const docID = p.block.rootID;
+    const target = this.resolveTarget(protyle);
+    const docID = target.docID;
     const attrs = (await this.api("/api/attr/getBlockAttrs", { id: docID })) || {};
     let refs = [];
     try { refs = JSON.parse(attrs[ATTR_REFS] || "[]"); } catch (e) { refs = []; }
@@ -511,23 +573,16 @@ class CiteDB extends siyuan.Plugin {
       await this.api("/api/attr/setBlockAttrs", { id: docID, attrs: { [ATTR_REFS]: JSON.stringify(refs) } });
     }
     const md = row.linked ? "[" + hit.n + "](siyuan://blocks/" + row.docID + ")" : "[" + hit.n + "]";
-    if (typeof p.insert === "function") {
-      p.insert(md);
-    } else if (typeof p.insertHTML === "function") {
-      p.insertHTML(
-        '<span data-type="block-ref" data-id="' + row.docID + '" data-subtype="s">' + hit.n + "</span>"
-      );
-    } else {
-      throw new Error("当前版本不支持直接插入，请手动粘贴：" + md);
-    }
+    const html = row.linked
+      ? '<span data-type="block-ref" data-id="' + row.docID + '" data-subtype="s">' + hit.n + "</span>"
+      : "[" + hit.n + "]";
+    target.insert(md, html);
     siyuan.showMessage("已插入 [" + hit.n + "]：" + text, 3000);
   }
 
   /* ---------------- 文末参考文献 ---------------- */
   async refreshBib(protyle) {
-    const p = protyle || this.lastProtyle;
-    if (!p || !p.block) throw new Error("请先在文档里点一下，再刷新参考文献");
-    const docID = p.block.rootID;
+    const docID = this.resolveTarget(protyle).docID;
     const attrs = (await this.api("/api/attr/getBlockAttrs", { id: docID })) || {};
     let refs = [];
     try { refs = JSON.parse(attrs[ATTR_REFS] || "[]"); } catch (e) { refs = []; }
