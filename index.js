@@ -234,6 +234,23 @@ class CiteDB extends siyuan.Plugin {
     return res.data;
   }
 
+  /** 统一解析出真正的 avID。
+   *  思源的 AV 块 id 与数据库 id 是两个东西（块 id 在 blocks 表里，数据库 id 藏在块的
+   *  markdown 里：<div data-type="NodeAttributeView" data-av-id="...">）。传错会拿到一个
+   *  自动新建的空壳（只有「主键/单选」两列），表现就是搜不到任何结果。
+   */
+  async resolveAv(id) {
+    try {
+      const rows = await this.api("/api/query/sql", { stmt: "SELECT markdown FROM blocks WHERE id = '" + id + "'" });
+      const md = rows && rows[0] && rows[0].markdown;
+      const m = md && /data-av-id="([^"]+)"/.exec(md);
+      if (m) return m[1];
+    } catch (e) {
+      /* 查不到就按原值用 */
+    }
+    return id;
+  }
+
   /* ---------------- 顶栏面板 ---------------- */
   openPanel() {
     const self = this;
@@ -294,8 +311,8 @@ class CiteDB extends siyuan.Plugin {
   async openAddSource() {
     const avs = await this.api("/api/query/sql", {
       stmt:
-        "SELECT b.id AS id, d.content AS docName FROM blocks b LEFT JOIN blocks d ON b.parent_id = d.id " +
-        "WHERE b.type = 'av' ORDER BY b.updated DESC LIMIT 80",
+        "SELECT b.id AS id, b.markdown AS markdown, d.content AS docName FROM blocks b " +
+        "LEFT JOIN blocks d ON b.parent_id = d.id WHERE b.type = 'av' ORDER BY b.updated DESC LIMIT 80",
     });
     if (!avs || !avs.length) {
       siyuan.showMessage("这个工作空间里没有属性视图（数据库）", 5000, "error");
@@ -303,8 +320,14 @@ class CiteDB extends siyuan.Plugin {
     }
     const self = this;
     let opts = "";
+    const avMap = {};
     avs.forEach(function (a) {
-      opts += '<option value="' + a.id + '">' + esc(a.docName || a.id) + "  ·  " + a.id.slice(-6) + "</option>";
+      const m = a.markdown && /data-av-id="([^"]+)"/.exec(a.markdown);
+      const avID = (m && m[1]) || a.id;
+      if (avMap[avID]) return;
+      avMap[avID] = true;
+      const label = (a.docName || a.id) + "  ·  " + avID.slice(-6);
+      opts += '<option value="' + avID + '">' + esc(label) + "</option>";
     });
     const html =
       '<div class="b3-dialog__content citeDB-panel">' +
@@ -331,6 +354,9 @@ class CiteDB extends siyuan.Plugin {
         const view = (await self.api("/api/av/renderAttributeView", { id: avSel.value, pageSize: 1, page: 1 })).view;
         keys = avColumns(view);
         viewName = avSel.options[avSel.selectedIndex].text.replace(/\s+·\s+\S+$/, "");
+        if (!keys.length || (keys.length === 2 && keys[0].name === "主键")) {
+          siyuan.showMessage("这个库里没有真实数据（可能不是数据库块），换一个试试", 6000, "error");
+        }
       } catch (e) {
         mapBox.innerHTML = '<div class="citeDB-tip">读取失败：' + esc(e.message) + "</div>";
         return;
@@ -405,8 +431,21 @@ class CiteDB extends siyuan.Plugin {
       const src = sources[Number(srcSel.value)];
       extra.style.display = src.kind === "law" ? "" : "none";
       box.innerHTML = '<div class="citeDB-tip">读取中…</div>';
-      const view = (await self.api("/api/av/renderAttributeView", { id: src.avID, pageSize: 1000, page: 1 })).view;
+      const avID = await self.resolveAv(src.avID);
+      const view = (await self.api("/api/av/renderAttributeView", { id: avID, pageSize: 1000, page: 1 })).view;
+      /* 自愈：配置里的列 id 可能来自别的库、或该库后来改过列，认不出来就按列名重新猜一次 */
+      const cols = avColumns(view);
+      const mapOk = !!(src.map && src.map.title && cols.some(function (c) { return c.id === src.map.title; }));
+      if (!mapOk && cols.length) {
+        src.map = guessMap(cols);
+        src.avID = avID;
+        await self.save();
+      }
       rows = avRows(view, src.map);
+      if (!rows.length) {
+        box.innerHTML = '<div class="citeDB-tip">这个数据源没读到数据：请到引注面板把它移除后重新「添加数据库」。</div>';
+        return;
+      }
       render(kw.value.trim());
     };
 
