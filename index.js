@@ -445,8 +445,7 @@ class CiteDB extends siyuan.Plugin {
       "</div>" +
       '<div class="citeDB-bar" id="citeDB-extra" style="display:none">' +
       '<span class="citeDB-law">第</span>' +
-      '<input id="citeDB-art" class="b3-text-field" list="citeDB-artlist" placeholder="点这里选，或直接输入，如 五">' +
-      '<datalist id="citeDB-artlist"></datalist>' +
+      '<input id="citeDB-art" class="b3-text-field" placeholder="条号，如 五 或 5（可留空）">' +
       '<span class="citeDB-law">条</span>' +
       '<button id="citeDB-go" class="b3-button b3-button--outline">插入</button></div>' +
       '<div class="citeDB-results" id="citeDB-results"><div class="citeDB-tip">输入关键词开始搜索</div></div>' +
@@ -460,40 +459,12 @@ class CiteDB extends siyuan.Plugin {
     const extra = root.querySelector("#citeDB-extra");
     const goBtn = root.querySelector("#citeDB-go");
     const hint = root.querySelector("#citeDB-hint");
-    const artList = root.querySelector("#citeDB-artlist");
     const box = root.querySelector("#citeDB-results");
     let rows = [];
     let pending = null;
 
     const srcOf = function () {
       return sources[Number(srcSel.value)];
-    };
-
-    /** 选中法规后，把这篇文章里出现的「第X条」抓出来做下拉候选 */
-    const loadArticles = async function (row) {
-      artList.innerHTML = "";
-      if (!row || !row.docID) return 0;
-      try {
-        const kd = ((await self.api("/api/block/getBlockKramdown", { id: row.docID })) || {}).kramdown || "";
-        const seen = {};
-        const list = [];
-        const re = /第([一二三四五六七八九十百千零〇\d]{1,8})条/g;
-        let m;
-        while ((m = re.exec(kd))) {
-          if (!seen[m[1]]) {
-            seen[m[1]] = 1;
-            list.push(m[1]);
-          }
-        }
-        artList.innerHTML = list
-          .map(function (n2) {
-            return '<option value="' + n2 + '">第' + n2 + "条</option>";
-          })
-          .join("");
-        return list.length;
-      } catch (e) {
-        return 0;
-      }
     };
 
     const insertRow = function (row) {
@@ -510,7 +481,6 @@ class CiteDB extends siyuan.Plugin {
       extra.style.display = isLaw ? "" : "none";
       kw.placeholder = isLaw ? "输入法规关键词，回车选中" : "输入关键词，回车插入";
       pending = null;
-      if (artList) artList.innerHTML = "";
       box.innerHTML = '<div class="citeDB-tip">读取中…</div>';
       const avID = await self.resolveAv(src.avID);
       const view = (await self.api("/api/av/renderAttributeView", { id: avID, pageSize: 1000, page: 1 })).view;
@@ -566,14 +536,9 @@ class CiteDB extends siyuan.Plugin {
             render(kw.value.trim());
             art.value = "";
             art.focus();
-            hint.textContent = "已选《" + String(row.title).slice(0, 30) + "》：正在读条款…";
-            self.safe(async function () {
-              const cnt = await loadArticles(row);
-              hint.textContent =
-                "已选《" + String(row.title).slice(0, 26) + "》：" +
-                (cnt ? "这篇有 " + cnt + " 条可选（点输入框下拉），" : "") +
-                "可留空，再按回车或「插入」。";
-            });
+            hint.textContent =
+              "已选《" + String(cleanLawTitle(row.title, row.cells[srcOf().map.wenhao])).slice(0, 30) +
+              "》：填第几条（可留空），回车或点「插入」。";
             return;
           }
           insertRow(row);
@@ -598,14 +563,9 @@ class CiteDB extends siyuan.Plugin {
         render(kw.value.trim());
         art.value = "";
         art.focus();
-        hint.textContent = "已选《" + String(row.title).slice(0, 30) + "》：正在读条款…";
-        self.safe(async function () {
-          const cnt = await loadArticles(row);
-          hint.textContent =
-            "已选《" + String(row.title).slice(0, 26) + "》：" +
-            (cnt ? "这篇有 " + cnt + " 条可选（点输入框下拉），" : "") +
-            "可留空，再按回车或「插入」。";
-        });
+        hint.textContent =
+          "已选《" + String(cleanLawTitle(row.title, row.cells[srcOf().map.wenhao])).slice(0, 30) +
+          "》：填第几条（可留空），回车或点「插入」。";
         return;
       }
       insertRow(firstRow());
@@ -696,11 +656,14 @@ class CiteDB extends siyuan.Plugin {
       hit.text = text;
     }
     await this.api("/api/attr/setBlockAttrs", { id: docID, attrs: { [ATTR_REFS]: JSON.stringify(refs) } });
-    /* 有链接的用思源原生块引写法 ((id "[n]"))，锚文本带方括号，显示和纯编号一致 */
-    const md = row.linked ? '((' + row.docID + ' "[' + hit.n + ']"))' : "[" + hit.n + "]";
+    /* 上标 + 思源原生块引：<sup>((id "[n]"))</sup>，渲染出来就是上标的 [n]，点它能跳。
+       （试过把 data-type="block-ref" 的 span 塞进 sup，思源会把属性吃掉只剩文字，所以走块引） */
+    const md = row.linked
+      ? "<sup>((" + row.docID + ' "[' + hit.n + ']"))</sup>'
+      : "<sup>[" + hit.n + "]</sup>";
     const html = row.linked
-      ? '<span data-type="block-ref" data-id="' + row.docID + '" data-subtype="s">[' + hit.n + "]</span>"
-      : "[" + hit.n + "]";
+      ? '<sup><span data-type="block-ref" data-id="' + row.docID + '" data-subtype="s">[' + hit.n + "]</span></sup>"
+      : "<sup>[" + hit.n + "]</sup>";
     target.insert(md, html);
     siyuan.showMessage("已插入 [" + hit.n + "]：" + text, 3000);
     /* 文末已经有参考文献的，插入后把编号和列表同步一次（没有就先不管，等用户刷新） */
@@ -774,15 +737,6 @@ class CiteDB extends siyuan.Plugin {
         order.push(m[1]);
       }
     }
-    const rows =
-      (await this.api("/api/query/sql", {
-        stmt: "SELECT id, type FROM blocks WHERE root_id = '" + docID + "'",
-      })) || [];
-    const typeOf = {};
-    rows.forEach(function (r) {
-      typeOf[r.id] = r.type;
-    });
-
     const assigned = {};
     const out = [];
     const changed = [];
@@ -790,14 +744,16 @@ class CiteDB extends siyuan.Plugin {
     for (let k = 0; k < order.length; k++) {
       const id = order[k];
       if (id === docID || bibIDs[id]) continue;
-      const t = typeOf[id];
-      if (t !== "p" && t !== "h") continue;
       let one = "";
       try {
         one = ((await this.api("/api/block/getBlockKramdown", { id: id })) || {}).kramdown || "";
       } catch (e) {
         continue;
       }
+      /* 只处理「自己就是一块」的：整块 kramdown 里只有一条 ial。
+         列表/引述这类容器块自带子块 ial，对它写回会把兄弟块的 id 带进去，思源报 block ID already exists */
+      if ((one.match(/\{:\s*id="/g) || []).length > 1) continue;
+      if (/type="doc"/.test(one)) continue;
       const clean = one.replace(/\{:[^}]*\}/g, "").trim();
       if (!clean) continue;
       let touched = false;
@@ -831,7 +787,13 @@ class CiteDB extends siyuan.Plugin {
         if (repl !== whole) touched = true;
         return repl;
       });
-      if (touched) changed.push({ id: id, md: md });
+      /* 统一成上标：老引用（当初没上标的）也一起升上来 */
+      const fin = md
+        .replace(/(?<!<sup>)(\(\([^()]{1,80}"\[\d+\]"\)\))/g, "<sup>$1</sup>")
+        .replace(/(?<!<sup>)\[(\d+)\](?!\()/g, "<sup>[$1]</sup>")
+        .trim();
+      if (fin !== clean) touched = true;
+      if (touched) changed.push({ id: id, md: fin });
     }
 
     let failed = 0;
