@@ -420,12 +420,15 @@ class CiteDB extends siyuan.Plugin {
     const html =
       '<div class="b3-dialog__content citeDB-search">' +
       '<div class="citeDB-bar"><select id="citeDB-src">' + srcOpts + "</select>" +
-      '<input id="citeDB-kw" class="b3-text-field" placeholder="输入关键词，回车插入第一条">' +
+      '<input id="citeDB-kw" class="b3-text-field" placeholder="输入关键词开始搜索">' +
       "</div>" +
       '<div class="citeDB-bar" id="citeDB-extra" style="display:none">' +
-      '<input id="citeDB-art" class="b3-text-field" placeholder="条号（可留空，如 五 或 5）"></div>' +
+      '<span class="citeDB-law">第</span>' +
+      '<input id="citeDB-art" class="b3-text-field" placeholder="条号，如 五 或 5（可留空）">' +
+      '<span class="citeDB-law">条</span>' +
+      '<button id="citeDB-go" class="b3-button b3-button--outline">插入</button></div>' +
       '<div class="citeDB-results" id="citeDB-results"><div class="citeDB-tip">输入关键词开始搜索</div></div>' +
-      '<div class="citeDB-tip">插入的是 [n] 形式的引用，点它可跳回原文献。</div>' +
+      '<div class="citeDB-tip" id="citeDB-hint">插入的是 [n] 形式的引用，点它可跳回原文献。</div>' +
       "</div>";
     const dialog = new siyuan.Dialog({ title: "插入引注", content: html, width: "660px" });
     const root = dialog.element;
@@ -433,12 +436,30 @@ class CiteDB extends siyuan.Plugin {
     const kw = root.querySelector("#citeDB-kw");
     const art = root.querySelector("#citeDB-art");
     const extra = root.querySelector("#citeDB-extra");
+    const goBtn = root.querySelector("#citeDB-go");
+    const hint = root.querySelector("#citeDB-hint");
     const box = root.querySelector("#citeDB-results");
     let rows = [];
+    let pending = null;
+
+    const srcOf = function () {
+      return sources[Number(srcSel.value)];
+    };
+
+    const insertRow = function (row) {
+      if (!row) return;
+      const src = srcOf();
+      const article = src.kind === "law" ? art.value.trim() : "";
+      dialog.destroy();
+      self.safe(() => self.doInsert(protyle, src, row, article));
+    };
 
     const loadRows = async function () {
-      const src = sources[Number(srcSel.value)];
-      extra.style.display = src.kind === "law" ? "" : "none";
+      const src = srcOf();
+      const isLaw = src.kind === "law";
+      extra.style.display = isLaw ? "" : "none";
+      kw.placeholder = isLaw ? "输入法规关键词，回车选中" : "输入关键词，回车插入";
+      pending = null;
       box.innerHTML = '<div class="citeDB-tip">读取中…</div>';
       const avID = await self.resolveAv(src.avID);
       const view = (await self.api("/api/av/renderAttributeView", { id: avID, pageSize: 1000, page: 1 })).view;
@@ -459,7 +480,7 @@ class CiteDB extends siyuan.Plugin {
     };
 
     const render = function (q) {
-      const src = sources[Number(srcSel.value)];
+      const src = srcOf();
       const list = rows.filter(function (r) {
         if (!q) return true;
         return (Object.keys(r.cells).map(function (k) { return r.cells[k]; }).join(" ") + r.title)
@@ -474,8 +495,11 @@ class CiteDB extends siyuan.Plugin {
       list.slice(0, 40).forEach(function (r, i) {
         const sub = [r.cells[src.map.author], r.cells[src.map.year], r.cells[src.map.container], r.cells[src.map.wenhao]]
           .filter(Boolean).join(" · ");
+        const idx = rows.indexOf(r);
         h +=
-          '<div class="citeDB-item' + (i === 0 ? " citeDB-item--first" : "") + '" data-i="' + rows.indexOf(r) + '">' +
+          '<div class="citeDB-item' + (i === 0 ? " citeDB-item--first" : "") +
+          (pending && rows.indexOf(pending) === idx ? " citeDB-item--picked" : "") +
+          '" data-i="' + idx + '">' +
           '<div class="citeDB-item-title">' + esc(r.title) + "</div>" +
           '<div class="citeDB-item-sub">' + esc(sub) + "</div></div>";
       });
@@ -483,37 +507,48 @@ class CiteDB extends siyuan.Plugin {
       box.querySelectorAll(".citeDB-item").forEach(function (el) {
         el.addEventListener("click", function () {
           const row = rows[Number(el.getAttribute("data-i"))];
-          const article = art.value.trim();
-          dialog.destroy();
-          self.safe(() => self.doInsert(protyle, src, row, article));
+          if (srcOf().kind === "law" && !art.value.trim()) {
+            /* 法规：先选中，再让用户填第几条，最后按「插入」或回车 */
+            pending = row;
+            render(kw.value.trim());
+            art.value = "";
+            art.focus();
+            hint.textContent = "已选《" + String(row.title).slice(0, 30) + "》：填第几条（可留空），再按回车或「插入」。";
+            return;
+          }
+          insertRow(row);
         });
       });
     };
 
     srcSel.addEventListener("change", function () { self.safe(loadRows); });
     kw.addEventListener("input", function () { render(kw.value.trim()); });
-    const srcOf = function () { return sources[Number(srcSel.value)]; };
-    const insertFirst = function () {
-      const first = box.querySelector(".citeDB-item");
-      if (first) first.click();
+    const firstRow = function () {
+      const el = box.querySelector(".citeDB-item");
+      return el ? rows[Number(el.getAttribute("data-i"))] : null;
     };
     kw.addEventListener("keydown", function (e) {
-      if (e.key !== "Enter") return;
+      if (e.key !== "Enter" || e.isComposing) return;
       e.preventDefault();
-      /* 法规：先让用户填第几条，再回车插入，不然永远只插到法规名 */
-      if (srcOf().kind === "law" && !art.value.trim()) {
+      if (srcOf().kind === "law") {
+        /* 法规：回车只「选中」，把光标送去条号框，填完再回车才插入 */
+        const row = pending || firstRow();
+        if (!row) return;
+        pending = row;
+        render(kw.value.trim());
+        art.value = "";
         art.focus();
-        art.placeholder = "填第几条（如 五 或 5），可留空；再按回车插入";
+        hint.textContent = "已选《" + String(row.title).slice(0, 30) + "》：填第几条（可留空），再按回车或「插入」。";
         return;
       }
-      insertFirst();
+      insertRow(firstRow());
     });
-    art.addEventListener("keydown", function (e) {
-      if (e.key === "Enter") {
-        e.preventDefault();
-        insertFirst();
-      }
-    });
+    const confirmLaw = function (e) {
+      if (e && e.key === "Enter") e.preventDefault();
+      insertRow(pending || firstRow());
+    };
+    art.addEventListener("keydown", confirmLaw);
+    goBtn.addEventListener("click", confirmLaw);
     await loadRows();
     setTimeout(function () { kw.focus(); }, 80);
   }

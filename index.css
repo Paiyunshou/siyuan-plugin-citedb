@@ -57,3 +57,11 @@
 .citeDB-item:hover, .citeDB-item--first { background: var(--b3-theme-surface-lighter); }
 .citeDB-item-title { font-size: 13.5px; line-height: 1.5; }
 .citeDB-item-sub { font-size: 12px; opacity: .55; margin-top: 2px; }
+
+.citeDB-search .citeDB-law { font-size: 13px; opacity: .65; padding: 0 2px; }
+.citeDB-search #citeDB-art { flex: 0 0 200px; }
+.citeDB-search #citeDB-go { flex: 0 0 auto; }
+.citeDB-item--picked {
+  background: var(--b3-theme-primary-lightest, rgba(240, 135, 42, .12));
+  box-shadow: inset 2px 0 0 var(--b3-theme-primary);
+}
