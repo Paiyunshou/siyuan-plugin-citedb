@@ -1,0 +1,74 @@
+name: Create Release on Tag Push
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Validate release version
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag_version="${GITHUB_REF_NAME#v}"
+          if [[ "$GITHUB_REF_NAME" != v* || -z "$tag_version" ]]; then
+            echo "Invalid release tag: $GITHUB_REF_NAME (expected v<version>)"
+            exit 1
+          fi
+          TAG_VERSION="$tag_version" node -e "
+            const p = require('./plugin.json'), q = require('./package.json');
+            const t = process.env.TAG_VERSION;
+            if (p.version !== t || q.version !== t) {
+              console.error('Version mismatch: tag=' + t + ' plugin=' + p.version + ' package=' + q.version);
+              process.exit(1);
+            }
+            if (!p.readme || !p.readme.default) {
+              console.error('plugin.json readme.default is required by the bazaar');
+              process.exit(1);
+            }
+          "
+
+      - name: Run unit tests
+        run: npm run check
+
+      - name: Build package.zip
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf dist package.zip
+          mkdir -p dist
+          cp -r plugin.json package.json index.js index.css icon.png preview.png \
+                README.md README_zh_CN.md CHANGELOG.md LICENSE i18n dist/
+          if [ -d assets ]; then cp -r assets dist/; fi
+          # 包根直接放文件（不能套一层目录），路径必须是正斜杠
+          cd dist && zip -rq ../package.zip . -x '.*' -x '*/.*'
+          cd .. && unzip -l package.zip | head -30
+
+      - name: Check icon / preview size limits
+        shell: bash
+        run: |
+          set -euo pipefail
+          icon=$(stat -c%s icon.png); preview=$(stat -c%s preview.png)
+          echo "icon=$icon preview=$preview"
+          [ "$icon" -le 65536 ] || { echo "icon.png must be <= 64KB"; exit 1; }
+          [ "$preview" -le 524288 ] || { echo "preview.png must be <= 512KB"; exit 1; }
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: package.zip
+          generate_release_notes: true

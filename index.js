@@ -1,14 +1,66 @@
-/* 引注 CiteDB — 0.2.0
+/* 引注 CiteDB — 0.4.0
  * 思源插件运行时是 CommonJS：require("siyuan") + module.exports 导出插件类。
  * 无构建链，改完 python3 tools/deploy.py 部署即生效。
  */
 const siyuan = require("siyuan");
 
-const VERSION = "0.2.0";
+const VERSION = "1.0.0";
+const SCHEMA = 2;
 const DATA_FILE = "citedb.json";
 const ATTR_REFS = "custom-citedb-refs";
 const ATTR_BIB = "custom-citedb-bib";
 const ATTR_NOTES = "custom-citedb-notes"; /* 法规走尾注，单独存一份，别和参考文献混 */
+
+/* 内置最小库的字段定义（自动建库 / 模板用）。块类型只能有一列，所以题名固定落在主键列上。 */
+const MINIMAL_PAPER = [
+  ["题名", "block"],
+  ["作者", "text"],
+  ["文献类型", "select"],
+  ["出版社/刊名", "text"],
+  ["出版地", "text"],
+  ["年份", "number"],
+  ["卷期", "text"],
+  ["页码", "text"],
+  ["译者", "text"],
+  ["副标题", "text"],
+];
+const PAPER_COL_ROLE = {
+  题名: "title",
+  作者: "author",
+  文献类型: "type",
+  "出版社/刊名": "container",
+  出版地: "place",
+  年份: "year",
+  卷期: "issue",
+  页码: "pages",
+  译者: "translator",
+  副标题: "subtitle",
+};
+const MINIMAL_LAW = [
+  ["法规名称", "block"],
+  ["文号", "text"],
+  ["效力", "select"],
+];
+const LAW_COL_ROLE = { 法规名称: "title", 文号: "wenhao" };
+
+/* 引注格式默认值：默认行为与 0.3.x 完全一致（GB/T 7714-2015 顺序编码制 + 圈码尾注） */
+const FORMAT_DEFAULTS = {
+  paperStyle: "gbt7714", /* gbt7714 | custom */
+  paperTpl: "{author}. {title}[{type}]. {place}: {container}, {year}: {pages}",
+  noteStyle: "bracket", /* bracket: 《名》（文号）第X条 | plain: 《名》第X条 | custom */
+  noteTpl: "《{title}》（{wenhao}）第{article}条",
+  authorMax: 3,
+  authorEtAl: true,
+  finalDot: true,
+  /* 正文标记：sup 上标编号 | inline 行内编号 | authoryear 著者-出版年 */
+  markStyle: "sup",
+};
+const INSERT_DEFAULTS = {
+  autoSync: true,
+  refTitle: "参考文献",
+  noteTitle: "注",
+  linkEntries: true,
+};
 
 const ICON_SVG = `<symbol id="iconCiteDB" viewBox="0 0 32 32"><rect x="0.6" y="0.6" width="30.8" height="30.8" rx="7.5" fill="#F0872A"/><g transform="translate(5.401,23.771) scale(0.01096,-0.01096)"><path d="M1526 1667H1820V-249H1526ZM432 637H1184L1151 120Q1141 -15 1088.5 -99.5Q1036 -184 943.0 -216.5Q850 -249 386 -249Q350 -97 304 41Q456 33 607 33Q729 33 773.5 51.5Q818 70 833.0 114.0Q848 158 862 379H114L180 1115H884V1343H122V1601H1178V857H448Z" fill="#FFFFFF"/></g></symbol>`;
 
@@ -26,15 +78,37 @@ const ROLE_LABELS = {
   subtitle: "副标题",
 };
 
+/* 映射对话框里按类型只显示相关角色 */
+const PAPER_ROLES = ["title", "author", "type", "container", "place", "year", "issue", "pages", "translator", "subtitle"];
+const LAW_ROLES = ["title", "wenhao"];
+
+/** 生成思源风格的块 id：20261126114207-c1kqu6t */
+function makeId() {
+  const d = new Date();
+  const p = function (n) {
+    return (n < 10 ? "0" : "") + n;
+  };
+  const ts =
+    "" + d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate()) + p(d.getHours()) + p(d.getMinutes()) + p(d.getSeconds());
+  const chars = "abcdefghijklmnopqrstuvwxyz0123456789";
+  let r = "";
+  for (let i = 0; i < 7; i++) r += chars[Math.floor(Math.random() * chars.length)];
+  return ts + "-" + r;
+}
+
 /* 字段名 -> 角色 的猜测规则（用户之后可在界面里改） */
 const HINT_BY_NAME = [
-  ["title", ["题名", "法规标题", "书名", "标题", "文献标题", "名称"]],
-  ["author", ["作者", "著者"]],
-  ["container", ["出版社/刊名", "出版社", "刊名", "出处", "期刊"]],
-  ["year", ["出版年", "年份", "发布日期", "实施日期", "发布年份"]],
+  ["title", ["法规名称", "文献标题", "题名", "书名", "标题", "文献名", "名称"]],
+  ["author", ["作者", "著者", "责任者"]],
+  ["container", ["出版社/刊名", "出版社", "出版者", "刊名", "期刊", "出处"]],
+  ["year", ["出版年", "发布年份", "发布日期", "实施日期", "年份"]],
   ["issue", ["卷期", "期号"]],
   ["pages", ["页码"]],
   ["wenhao", ["文号", "发文字号"]],
+  ["type", ["文献类型", "类型"]],
+  ["place", ["出版地", "出版城市"]],
+  ["translator", ["译者", "翻译者"]],
+  ["subtitle", ["副标题", "副题名"]],
 ];
 
 /* ---------------- 纯函数（可单测） ---------------- */
@@ -64,15 +138,36 @@ function cellText(v) {
   return "";
 }
 
-/** 按字段名猜测角色 -> keyID */
+/** 按字段名猜测角色 -> keyID。打分后贪心分配：
+ *  精确同名 100 / 前缀 70 / 包含 40-长度差；「副标题」不许抢题名的位置
+ *  （0.3.x 用 keys.find 取第一个包含命中的，列顺序一变就会把副标题当成题名）。
+ */
 function guessMap(keys) {
-  const guess = {};
+  const cands = [];
   HINT_BY_NAME.forEach(function (pair) {
     const role = pair[0];
-    const hit = keys.find(function (k) {
-      return pair[1].some(function (h) { return k.name.indexOf(h) >= 0; });
+    keys.forEach(function (k) {
+      const name = String(k.name || "").trim();
+      if (!name) return;
+      let best = 0;
+      pair[1].forEach(function (h) {
+        if (name === h) best = Math.max(best, 100);
+        else if (name.indexOf(h) === 0) best = Math.max(best, 70);
+        else if (name.indexOf(h) >= 0) best = Math.max(best, 40 - Math.min(20, name.length - h.length));
+      });
+      if (!best) return;
+      if (role === "title" && /副/.test(name)) best -= 60;
+      if (role === "subtitle" && /副/.test(name)) best += 30;
+      if (best > 0) cands.push({ role: role, keyID: k.id, score: best });
     });
-    if (hit) guess[role] = hit.id;
+  });
+  cands.sort(function (a, b) { return b.score - a.score; });
+  const guess = {};
+  const used = {};
+  cands.forEach(function (c) {
+    if (guess[c.role] || used[c.keyID]) return;
+    guess[c.role] = c.keyID;
+    used[c.keyID] = 1;
   });
   return guess;
 }
@@ -177,14 +272,18 @@ function typeCode(s) {
   return "M";
 }
 
-/** 责任者：逗号/顿号/分号分隔；超过 3 个只留前 3 个加「, 等」 */
-function authorList(s) {
+/** 责任者：逗号/顿号/分号分隔；超过 max 个只留前 max 个，按配置加「, 等」 */
+function authorList(s, max, etAl) {
   const arr = String(s || "")
     .split(/[，,；;、\/]+/)
     .map(function (x) { return x.trim(); })
     .filter(function (x) { return x && x !== "等"; });
   if (!arr.length) return "";
-  if (arr.length > 3) return arr.slice(0, 3).join(", ") + ", 等";
+  const n = Number(max) > 0 ? Number(max) : 3;
+  if (arr.length > n) {
+    if (etAl === false) return arr.join(", ");
+    return arr.slice(0, n).join(", ") + ", 等";
+  }
   return arr.join(", ");
 }
 
@@ -199,13 +298,75 @@ function splitIssue(raw, year) {
   return { year: year || "", issue: issue };
 }
 
-/** 文献库 → 参考文献条目（GB/T 7714-2015 顺序编码制）
- *  图书：贾宁. 贾宁财务讲义[M]. 北京: 中信出版集团, 2020: 45.
- *  译著：惠特默. 高绩效教练: 原书第5版[M]. 林菲, 译. 北京: 机械工业出版社, 2018: 12.
- *  期刊：张某. 增值税留抵退税的风险识别[J]. 税务研究, 2023(9): 55-58.
- *  extra 是引用页码（图书才有，插入时手填）
+/** 格式配置：缺省项回落到默认值 */
+function fmtOf(cfg) {
+  return Object.assign({}, FORMAT_DEFAULTS, (cfg && cfg.format) || {});
+}
+
+/** 著者-年制里作者只留第一位，多作者加「等」 */
+function authorShort(a) {
+  const parts = String(a || "")
+    .split(/[,，、;；]/)
+    .map(function (x) {
+      return x.trim();
+    })
+    .filter(Boolean);
+  if (!parts.length) return "";
+  return parts.length > 1 ? parts[0] + " 等" : parts[0];
+}
+
+/** 正文里这条引用的显示标签：编号制 [n]，著者-年制 （作者，年：页码） */
+function refLabelOf(e, style) {
+  if (style === "authoryear" && e) {
+    const a = authorShort(e.author);
+    if (a) {
+      const y = String(e.year || "").trim();
+      const pg = String(e.article || "").trim();
+      return "（" + a + (y ? "，" + y : "") + (pg ? "：" + pg : "") + "）";
+    }
+  }
+  return "[" + ((e && e.n) || 0) + "]";
+}
+
+/** 实际生效的正文标记样式：选了著者-年但条目缺作者时整体退回行内编号 */
+function effectiveMarkStyle(config, refs) {
+  const want = fmtOf(config).markStyle || "sup";
+  if (want !== "authoryear") return want;
+  const list = refs || [];
+  if (!list.length) return "inline";
+  return list.every(function (r) {
+    return !!authorShort(r.author);
+  })
+    ? "authoryear"
+    : "inline";
+}
+
+/** 自定义模板渲染：先把占位符换成值，再清掉空字段留下的悬空标点 */
+function renderTpl(tpl, ctx) {
+  let out = String(tpl || "").replace(/\{(\w+)\}/g, function (m, k) {
+    return ctx[k] == null ? "" : String(ctx[k]);
+  });
+  out = out.replace(/[（(]\s*[）)]/g, "").replace(/第\s*条/g, "");
+  for (let i = 0; i < 3; i++) {
+    out = out
+      .replace(/([,.，。、;；])\s*[:：]\s*/g, "$1 ")
+      .replace(/\s*[:：]\s*(?=[,.，。;；、]|$)/g, "")
+      .replace(/([,.，。、;；])(?:\s*[,，、;；:：])+/g, "$1");
+  }
+  return out
+    .replace(/\s*([,.，。、;；])/g, "$1")
+    .replace(/\s{2,}/g, " ")
+    .replace(/^[\s,.，。;；:：、]+/, "")
+    .replace(/[,，、;；:：\s]+$/, "")
+    .trim();
+}
+
+/** 文献库 → 参考文献条目
+ *  gbt7714（默认，与 0.3.x 一致）：贾宁. 贾宁财务讲义[M]. 北京: 中信出版集团, 2020: 45.
+ *  custom：按用户模板，可用占位符见设置页说明
  */
-function citePaper(src, cells, extra) {
+function citePaper(src, cells, extra, cfg) {
+  const f = fmtOf(cfg);
   const g = function (role) {
     const k = src.map && src.map[role];
     return k && cells[k] ? String(cells[k]).trim() : "";
@@ -213,12 +374,32 @@ function citePaper(src, cells, extra) {
   const title = g("title");
   if (!title) return "（缺题名）";
   const code = typeCode(g("type"));
-  const authors = authorList(g("author"));
+  const si = splitIssue(g("issue"), g("year"));
+  const pages = code === "J" ? g("pages") : String(extra || "").trim() || g("pages");
+  const authors = authorList(g("author"), f.authorMax, f.authorEtAl);
+
+  if (f.paperStyle === "custom") {
+    let out = renderTpl(f.paperTpl, {
+      author: authors,
+      title: title,
+      subtitle: g("subtitle"),
+      type: code,
+      place: g("place"),
+      container: g("container"),
+      year: si.year,
+      issue: si.issue,
+      pages: pages,
+      translator: authorList(g("translator"), f.authorMax, f.authorEtAl),
+    });
+    if (!out) out = title;
+    if (f.finalDot !== false && !/[.。]$/.test(out)) out += ".";
+    return out;
+  }
+
   const sub = g("subtitle");
-  const trans = authorList(g("translator"));
+  const trans = authorList(g("translator"), f.authorMax, f.authorEtAl);
   const container = g("container");
   const place = g("place");
-  const si = splitIssue(g("issue"), g("year"));
   let out = authors ? authors + ". " : "";
   out += title + (sub ? ": " + sub : "") + "[" + code + "]";
   if (trans) out += ". " + trans + ", 译";
@@ -226,13 +407,18 @@ function citePaper(src, cells, extra) {
   if (container) out += ". " + (place && code !== "J" ? place + ": " : "") + container;
   if (si.year) out += ", " + si.year;
   if (code === "J" && si.issue) out += "(" + si.issue + ")";
-  const p = code === "J" ? g("pages") : String(extra || "").trim();
-  if (p) out += ": " + p;
+  if (pages) out += ": " + pages;
+  if (f.finalDot === false) return out;
   return out + ".";
 }
 
-/** 法规 → 尾注文字：《法规名》（文号）第X条。 */
-function citeLaw(src, cells, article) {
+/** 法规 → 尾注文字
+ *  bracket（默认）：《法规名》（文号）第X条
+ *  plain：《法规名》第X条    custom：按用户模板
+ *  法规条目一律不加结尾句号。
+ */
+function citeLaw(src, cells, article, cfg) {
+  const f = fmtOf(cfg);
   const g = function (role) {
     const k = src.map && src.map[role];
     return k && cells[k] ? String(cells[k]).trim() : "";
@@ -240,17 +426,52 @@ function citeLaw(src, cells, article) {
   const title = g("title");
   if (!title) return "（缺法规名）";
   const wenhao = g("wenhao");
-  let out = "《" + cleanLawTitle(title, wenhao) + "》";
-  if (wenhao) out += "（" + wenhao + "）";
   const a = String(article || "").trim();
+  if (f.noteStyle === "custom") {
+    return renderTpl(f.noteTpl, { title: cleanLawTitle(title, wenhao), wenhao: wenhao, article: a });
+  }
+  let out = "《" + cleanLawTitle(title, wenhao) + "》";
+  if (f.noteStyle !== "plain" && wenhao) out += "（" + wenhao + "）";
   if (a) out += "第" + a + "条";
   /* 尾注条目结尾不加句号（用户觉得多余），文中上标也不带标点 */
   return out;
 }
 
-function citeText(src, cells, extra) {
-  if (src.kind === "law") return citeLaw(src, cells, extra);
-  return citePaper(src, cells, extra);
+function citeText(src, cells, extra, cfg) {
+  if (src.kind === "law") return citeLaw(src, cells, extra, cfg);
+  return citePaper(src, cells, extra, cfg);
+}
+
+/** 配置默认值 */
+function defaultConfig() {
+  return {
+    version: SCHEMA,
+    sources: [],
+    format: Object.assign({}, FORMAT_DEFAULTS),
+    insert: Object.assign({}, INSERT_DEFAULTS),
+    newLibNotebook: "",
+  };
+}
+
+/** v1（只有 version/sources）→ v2：补 format / insert，并给数据源补 kind/origin。
+ *  老配置的映射原样保留，不猜不覆盖。 */
+function migrateConfig(saved) {
+  const cfg = defaultConfig();
+  if (!saved || typeof saved !== "object") return cfg;
+  cfg.newLibNotebook = saved.newLibNotebook || "";
+  cfg.format = Object.assign({}, FORMAT_DEFAULTS, saved.format || {});
+  cfg.insert = Object.assign({}, INSERT_DEFAULTS, saved.insert || {});
+  cfg.sources = (Array.isArray(saved.sources) ? saved.sources : []).map(function (s) {
+    return {
+      name: s.name || "数据源",
+      avID: s.avID || "",
+      kind: s.kind === "law" ? "law" : "paper",
+      origin: s.origin || "existing",
+      map: s.map || {},
+    };
+  });
+  cfg.version = SCHEMA;
+  return cfg;
 }
 
 /* ---------------- 插件 ---------------- */
@@ -258,8 +479,15 @@ function citeText(src, cells, extra) {
 class CiteDB extends siyuan.Plugin {
   constructor(options) {
     super(options);
-    this.config = { version: 1, sources: [] };
+    this.config = defaultConfig();
     this.lastProtyle = null;
+    if (typeof siyuan.Setting === "function") {
+      try {
+        this.setting = this.buildSetting();
+      } catch (e) {
+        console.warn("[citedb] 设置面板构建失败", e);
+      }
+    }
     this.protyleSlash = [
       {
         filter: ["引注", "cite", "citedb", "参考文献", "法条"],
@@ -278,7 +506,9 @@ class CiteDB extends siyuan.Plugin {
   async onload() {
     try {
       const saved = await this.loadData(DATA_FILE);
-      if (saved && saved.sources) this.config = saved;
+      this.config = migrateConfig(saved);
+      /* 老配置升级后立刻写回，免得每次启动都迁移一遍 */
+      if (saved && saved.version !== SCHEMA) await this.save();
     } catch (e) {
       console.error("[citedb] 读取配置失败", e);
     }
@@ -345,6 +575,840 @@ class CiteDB extends siyuan.Plugin {
     await this.saveData(DATA_FILE, this.config);
   }
 
+  /** 用磁盘上最新的配置覆盖内存里那份：多标签页/换设备时内存里的可能过期，
+      否则「设置里改了样式，刷新还是老样子」 */
+  async syncConfigFromDisk() {
+    try {
+      const saved = await this.loadData(DATA_FILE);
+      if (!saved) return;
+      if (saved.format) this.config.format = Object.assign({}, FORMAT_DEFAULTS, saved.format);
+      if (saved.insert) this.config.insert = Object.assign({}, INSERT_DEFAULTS, saved.insert);
+    } catch (e) {
+      /* 读不到就用内存里的 */
+    }
+  }
+
+  /* ---------------- 设置面板 ---------------- */
+
+  /** 设置项清单：标题 + 说明 + 渲染函数。集市里的齿轮和面板里的「设置」共用同一份 */
+  settingItems() {
+    const self = this;
+    const f = this.config.format;
+    const ins = this.config.insert;
+    const items = [];
+
+    const mkSel = function (opts, value, cb) {
+      const s = document.createElement("select");
+      s.className = "b3-select citeDB-set-sel";
+      opts.forEach(function (o) {
+        const op = document.createElement("option");
+        op.value = o[0];
+        op.textContent = o[1];
+        if (o[0] === value) op.selected = true;
+        s.appendChild(op);
+      });
+      s.addEventListener("change", function () {
+        cb(s.value);
+      });
+      return s;
+    };
+    const mkText = function (value, ph, cb, cls) {
+      const i = document.createElement("input");
+      i.className = "b3-text-field " + (cls || "");
+      i.value = value == null ? "" : value;
+      i.placeholder = ph || "";
+      i.addEventListener("change", function () {
+        cb(i.value);
+      });
+      return i;
+    };
+    const mkCheck = function (label, checked, cb) {
+      const l = document.createElement("label");
+      l.className = "citeDB-set-check";
+      const i = document.createElement("input");
+      i.type = "checkbox";
+      i.checked = !!checked;
+      i.addEventListener("change", function () {
+        cb(i.checked);
+      });
+      l.appendChild(i);
+      l.appendChild(document.createTextNode(label));
+      return l;
+    };
+    const hint = function (text) {
+      const d = document.createElement("div");
+      d.className = "citeDB-set-hint";
+      d.textContent = text;
+      return d;
+    };
+    const col = function () {
+      const d = document.createElement("div");
+      d.className = "citeDB-set-col";
+      for (let i = 0; i < arguments.length; i++) if (arguments[i]) d.appendChild(arguments[i]);
+      return d;
+    };
+    const item = function (title, desc, el) {
+      items.push({ title: title, desc: desc, render: el });
+    };
+
+    /* 1. 数据源管理 */
+    const srcBox = document.createElement("div");
+    self.settingRefresh = function () {
+      self.renderSources(srcBox);
+    };
+    item("数据源", "文献库与脚注库分开放。新建的库字段固定，不用映射；用自己的库才需要手动对字段。", function () {
+      self.renderSources(srcBox);
+      return srcBox;
+    });
+
+    /* 2. 新建最小库 */
+    const newBox = document.createElement("div");
+    item("新建数据库（还没有库的人）", "选一个笔记本，插件会在里面新建「引注数据源」文档，并把库和字段一次建好。", function () {
+      self.renderNewLib(newBox);
+      return newBox;
+    });
+
+    /* 3. 正文标记样式 */
+    const markSel = mkSel(
+      [
+        ["sup", "上标编号：正文 ᵗ[1] / ᵗ①"],
+        ["inline", "行内编号：正文 [1] / ①（正常字号）"],
+        ["authoryear", "著者-出版年：正文（作者，年：页码）"],
+      ],
+      f.markStyle || "sup",
+      function (v) {
+        self.config.format = self.config.format || {};
+        self.config.format.markStyle = v;
+        const name = v === "authoryear" ? "著者-出版年" : v === "inline" ? "行内编号" : "上标编号";
+        self.safe(function () {
+          return self.save().then(function () {
+            siyuan.showMessage("正文标记已设为「" + name + "」，在文档里点「刷新参考文献」生效", 5000);
+          });
+        });
+      }
+    );
+    item(
+      "正文标记",
+      "改完在文档里点「刷新参考文献」即可把已有引用一并重排。著者-出版年制要求条目绑定了文档、且库里有作者和年份，缺的回退成编号；文末参考文献不编号、按第一作者排序。",
+      function () {
+        return col(markSel);
+      }
+    );
+
+    /* 4. 文献条目格式 */
+    const paperTpl = mkText(f.paperTpl, "{author}. {title}[{type}]. {place}: {container}, {year}: {pages}", function (v) {
+      self.config.format.paperTpl = v;
+      self.safe(function () { return self.save(); });
+    }, "citeDB-set-tpl");
+    const paperSel = mkSel(
+      [
+        ["gbt7714", "GB/T 7714-2015 顺序编码制"],
+        ["custom", "自定义模板"],
+      ],
+      f.paperStyle,
+      function (v) {
+        self.config.format.paperStyle = v;
+        self.safe(function () { return self.save(); });
+        syncPaper();
+      }
+    );
+    const syncPaper = function () {
+      const on = self.config.format.paperStyle === "custom";
+      paperTpl.disabled = !on;
+      paperTpl.style.opacity = on ? "" : ".4";
+    };
+    item(
+      "文献条目格式",
+      "默认与 GB/T 7714-2015 一致（图书 M / 期刊 J / 学位论文 D …）。",
+      function () {
+        syncPaper();
+        return col(paperSel, paperTpl, hint("自定义可用：{author} {title} {subtitle} {type} {place} {container} {year} {issue} {pages} {translator}"));
+      }
+    );
+
+    /* 5. 法规条目格式 */
+    const noteTpl = mkText(f.noteTpl, "《{title}》（{wenhao}）第{article}条", function (v) {
+      self.config.format.noteTpl = v;
+      self.safe(function () { return self.save(); });
+    }, "citeDB-set-tpl");
+    const noteSel = mkSel(
+      [
+        ["bracket", "《法规名》（文号）第X条"],
+        ["plain", "《法规名》第X条"],
+        ["custom", "自定义模板"],
+      ],
+      f.noteStyle,
+      function (v) {
+        self.config.format.noteStyle = v;
+        self.safe(function () { return self.save(); });
+        syncNote();
+      }
+    );
+    const syncNote = function () {
+      const on = self.config.format.noteStyle === "custom";
+      noteTpl.disabled = !on;
+      noteTpl.style.opacity = on ? "" : ".4";
+    };
+    item(
+      "法规条目格式",
+      "法规走尾注（①），条目结尾不加句号。",
+      function () {
+        syncNote();
+        return col(noteSel, noteTpl, hint("自定义可用：{title} {wenhao} {article}"));
+      }
+    );
+
+    /* 5. 作者人数与省略 */
+    item(
+      "作者人数",
+      "超过这个人数时只列前几位；不勾「等」就全部列出。",
+      function () {
+        return col(
+          mkText(String(f.authorMax), "3", function (v) {
+            const n = parseInt(v, 10);
+            self.config.format.authorMax = n > 0 ? n : 3;
+            self.safe(function () { return self.save(); });
+          }, "citeDB-set-num"),
+          mkCheck("超出时加「等」", f.authorEtAl, function (v) {
+            self.config.format.authorEtAl = v;
+            self.safe(function () { return self.save(); });
+          })
+        );
+      }
+    );
+
+    /* 6. 条目结尾句号 */
+    item(
+      "文献条目结尾加句号",
+      "法规条目始终不加句号。",
+      function () {
+        return mkCheck("在本条末尾加「.」", f.finalDot, function (v) {
+          self.config.format.finalDot = v;
+          self.safe(function () { return self.save(); });
+        });
+      }
+    );
+
+    /* 7. 插入行为 */
+    item(
+      "插入后自动更新文末",
+      "关掉后要手动执行命令「刷新参考文献」才更新。",
+      function () {
+        return mkCheck("每次插入后自动重排编号、重建文末列表", ins.autoSync, function (v) {
+          self.config.insert.autoSync = v;
+          self.safe(function () { return self.save(); });
+        });
+      }
+    );
+
+    /* 8. 文末标题 */
+    item(
+      "文末标题",
+      "改成「注释」「引用文献」之类。改完点一次「刷新参考文献」，旧标题块会被替换。",
+      function () {
+        return col(
+          mkText(ins.refTitle, "参考文献", function (v) {
+            self.config.insert.refTitle = v.trim() || "参考文献";
+            self.safe(function () { return self.save(); });
+          }, "citeDB-set-title"),
+          mkText(ins.noteTitle, "注", function (v) {
+            self.config.insert.noteTitle = v.trim() || "注";
+            self.safe(function () { return self.save(); });
+          }, "citeDB-set-title")
+        );
+      }
+    );
+
+    /* 9. 条目双链 */
+    item(
+      "条目标题带双链",
+      "条目的书名/法规名做成块引，点击可跳到原文文档（库里的格子必须绑了文档）。",
+      function () {
+        return mkCheck("生成 [标题](siyuan://blocks/…)", ins.linkEntries, function (v) {
+          self.config.insert.linkEntries = v;
+          self.safe(function () { return self.save(); });
+        });
+      }
+    );
+
+    /* 10. 配置导入导出 */
+    item(
+      "配置备份",
+      "导出后可以换设备导入，或分享给同行（只含数据源和格式设置，不含笔记内容）。",
+      function () {
+        const box = document.createElement("div");
+        box.className = "citeDB-set-col citeDB-set-row";
+        const bExp = document.createElement("button");
+        bExp.className = "b3-button b3-button--outline";
+        bExp.textContent = "导出配置";
+        bExp.addEventListener("click", function () {
+          self.safe(function () {
+            return self.exportConfig();
+          });
+        });
+        const bImp = document.createElement("button");
+        bImp.className = "b3-button b3-button--outline";
+        bImp.textContent = "导入配置";
+        bImp.addEventListener("click", function () {
+          self.safe(function () {
+            return self.importConfig();
+          });
+        });
+        box.appendChild(bExp);
+        box.appendChild(bImp);
+        return box;
+      }
+    );
+
+    return items;
+  }
+
+  /** 集市 → 已下载 → 插件设置（齿轮）：思源自带的设置容器 */
+  buildSetting() {
+    const self = this;
+    if (typeof siyuan.Setting !== "function") return null;
+    const setting = new siyuan.Setting({
+      confirmCallback: function () {
+        self.safe(function () {
+          return self.save();
+        });
+      },
+    });
+    this.settingItems().forEach(function (it) {
+      try {
+        setting.addItem({ title: it.title, description: it.desc, createActionElement: it.render });
+      } catch (e) {
+        console.warn("[citedb] 设置项「" + it.title + "」挂载失败", e);
+      }
+    });
+    return setting;
+  }
+
+  /** 面板里的「设置」：不依赖 siyuan.Setting，自己拉一个对话框，内容与齿轮一致 */
+  openSettings() {
+    const items = this.settingItems();
+    const dialog = new siyuan.Dialog({
+      title: "引注 CiteDB 设置 " + VERSION,
+      content: '<div class="b3-dialog__content citeDB-settings"></div>',
+      width: "720px",
+    });
+    const box = dialog.element.querySelector(".citeDB-settings") || dialog.element;
+    const self = this;
+    items.forEach(function (it) {
+      const sec = document.createElement("div");
+      sec.className = "citeDB-set-sec";
+      const h = document.createElement("div");
+      h.className = "citeDB-set-title2";
+      h.textContent = it.title;
+      const d = document.createElement("div");
+      d.className = "citeDB-set-hint";
+      d.textContent = it.desc || "";
+      sec.appendChild(h);
+      if (it.desc) sec.appendChild(d);
+      try {
+        sec.appendChild(it.render());
+      } catch (e) {
+        const err = document.createElement("div");
+        err.className = "citeDB-set-hint";
+        err.textContent = "这一项没渲染出来：" + ((e && e.message) || e);
+        sec.appendChild(err);
+      }
+      box.appendChild(sec);
+    });
+    const foot = document.createElement("div");
+    foot.className = "citeDB-actions";
+    const close = document.createElement("button");
+    close.className = "b3-button b3-button--text";
+    close.textContent = "完成";
+    close.addEventListener("click", function () {
+      self.safe(async function () {
+        await self.save();
+        dialog.destroy();
+      });
+    });
+    foot.appendChild(close);
+    box.appendChild(foot);
+  }
+
+  /* ---------------- 设置：数据源列表 ---------------- */
+
+  sourcesHtml() {
+    const sources = this.config.sources || [];
+    const self = this;
+    let h = "";
+    [
+      ["paper", "文献库"],
+      ["law", "脚注库（法规）"],
+    ].forEach(function (pair) {
+      const list = [];
+      sources.forEach(function (s, i) {
+        if (s.kind === pair[0]) list.push({ s: s, i: i });
+      });
+      h += '<div class="citeDB-set-group"><div class="citeDB-set-gtitle">' + pair[1] + "</div>";
+      if (!list.length) {
+        h += '<div class="citeDB-set-empty">还没有' + pair[1] + "</div>";
+      } else {
+        h += '<table class="citeDB-table"><tbody>';
+        list.forEach(function (x) {
+          const n = Object.keys(x.s.map || {}).filter(function (k) {
+            return !!x.s.map[k];
+          }).length;
+          const origin = x.s.origin === "created" ? "插件新建" : x.s.origin === "template" ? "模板" : "已有库";
+          h +=
+            "<tr><td>" +
+            esc(x.s.name) +
+            '</td><td class="citeDB-dim">' +
+            origin +
+            " · " +
+            n +
+            " 字段</td>" +
+            '<td class="citeDB-set-ops">' +
+            '<a class="citeDB-link" data-act="edit" data-i="' + x.i + '">改映射</a> ' +
+            '<a class="citeDB-link" data-act="up" data-i="' + x.i + '">上移</a> ' +
+            '<a class="citeDB-link" data-act="rename" data-i="' + x.i + '">改名</a> ' +
+            '<a class="citeDB-link" data-act="del" data-i="' + x.i + '">移除</a>' +
+            "</td></tr>";
+        });
+        h += "</tbody></table>";
+      }
+      h += "</div>";
+    });
+    return h;
+  }
+
+  renderSources(box) {
+    const self = this;
+    box.innerHTML =
+      this.sourcesHtml() +
+      '<div class="citeDB-set-row">' +
+      '<button class="b3-button b3-button--outline" id="cdb-add">用我已有的数据库</button>' +
+      '<button class="b3-button b3-button--outline" id="cdb-test">检查数据源</button>' +
+      "</div>";
+    box.querySelectorAll(".citeDB-link").forEach(function (a) {
+      a.addEventListener("click", function () {
+        const i = Number(a.getAttribute("data-i"));
+        const act = a.getAttribute("data-act");
+        const s = self.config.sources[i];
+        if (!s) return;
+        const rerender = function () {
+          self.renderSources(box);
+        };
+        if (act === "del") {
+          if (!window.confirm("移除「" + s.name + "」？\n已插入正文的引注不会被删除，但之后不能再从它取引注。")) return;
+          self.config.sources.splice(i, 1);
+          self.safe(async function () {
+            await self.save();
+            rerender();
+          });
+        } else if (act === "rename") {
+          const name = window.prompt("数据源名称", s.name);
+          if (!name || !name.trim()) return;
+          s.name = name.trim();
+          self.safe(async function () {
+            await self.save();
+            rerender();
+          });
+        } else if (act === "up") {
+          /* 只在同类里上移：决定搜索结果里谁排前面 */
+          let prev = -1;
+          for (let k = i - 1; k >= 0; k--) {
+            if (self.config.sources[k].kind === s.kind) {
+              prev = k;
+              break;
+            }
+          }
+          if (prev < 0) return;
+          self.config.sources.splice(prev, 0, self.config.sources.splice(i, 1)[0]);
+          self.safe(async function () {
+            await self.save();
+            rerender();
+          });
+        } else if (act === "edit") {
+          self.safe(function () {
+            return self.sourceDialog(i, rerender);
+          });
+        }
+      });
+    });
+    const add = box.querySelector("#cdb-add");
+    if (add)
+      add.addEventListener("click", function () {
+        self.safe(function () {
+          return self.sourceDialog(null, function () {
+            self.renderSources(box);
+          });
+        });
+      });
+    const test = box.querySelector("#cdb-test");
+    if (test)
+      test.addEventListener("click", function () {
+        self.safe(function () {
+          return self.checkSources();
+        });
+      });
+  }
+
+  /** 逐个读一遍数据源，报行数/失效 */
+  async checkSources() {
+    const sources = this.config.sources || [];
+    if (!sources.length) {
+      siyuan.showMessage("还没有数据源", 3000);
+      return;
+    }
+    const bad = [];
+    const good = [];
+    for (let i = 0; i < sources.length; i++) {
+      const s = sources[i];
+      try {
+        const avID = await this.resolveAv(s.avID);
+        const view = (await this.api("/api/av/renderAttributeView", { id: avID, pageSize: 1000, page: 1 })).view;
+        const rows = avRows(view, s.map || {});
+        if (!rows.length) bad.push(s.name + "（能打开但没有数据）");
+        else good.push(s.name + " " + rows.length + " 条");
+      } catch (e) {
+        bad.push(s.name + "（打不开：" + ((e && e.message) || e) + "）");
+      }
+    }
+    let msg = good.length ? "正常：" + good.join("、") : "";
+    if (bad.length) msg += (msg ? "；" : "") + "有问题：" + bad.join("、");
+    siyuan.showMessage(msg || "检查完成", 8000, bad.length ? "error" : "");
+  }
+
+  /* ---------------- 设置：新建最小库 ---------------- */
+
+  async renderNewLib(box) {
+    const self = this;
+    let nbs = [];
+    try {
+      const r = await this.api("/api/notebook/lsNotebooks", {});
+      nbs = ((r && r.notebooks) || []).filter(function (n) {
+        return !n.closed;
+      });
+    } catch (e) {
+      box.innerHTML = '<div class="citeDB-set-empty">读不到笔记本：' + esc((e && e.message) || e) + "</div>";
+      return;
+    }
+    if (!nbs.length) {
+      box.innerHTML = '<div class="citeDB-set-empty">还没有笔记本，先在思源里新建一个</div>';
+      return;
+    }
+    const cur = this.config.newLibNotebook && nbs.some(function (n) { return n.id === self.config.newLibNotebook; })
+      ? this.config.newLibNotebook
+      : nbs[0].id;
+    let opts = "";
+    nbs.forEach(function (n) {
+      opts += '<option value="' + n.id + '"' + (n.id === cur ? " selected" : "") + ">" + esc(n.name) + "</option>";
+    });
+    box.innerHTML =
+      '<div class="citeDB-field"><label>放到笔记本</label><select id="cdb-nb" class="b3-select">' + opts + "</select></div>" +
+      '<div class="citeDB-set-row">' +
+      '<button class="b3-button b3-button--text" id="cdb-new-paper">新建文献库</button>' +
+      '<button class="b3-button b3-button--text" id="cdb-new-law">新建脚注库（法规）</button>' +
+      '<button class="b3-button b3-button--outline" id="cdb-detect">从模板导入 / 识别现有库</button>' +
+      "</div>" +
+      '<div class="citeDB-set-hint">新建的库：文献库 10 个字段、脚注库 3 个字段，建好即用，不用映射。<br>' +
+      '别人给的 .sy 模板：先拖进思源任意笔记本，再点「从模板导入 / 识别现有库」，插件自动认字段。</div>';
+    const nbSel = box.querySelector("#cdb-nb");
+    nbSel.addEventListener("change", function () {
+      self.config.newLibNotebook = nbSel.value;
+      self.safe(function () {
+        return self.save();
+      });
+    });
+    const run = function (kind) {
+      self.safe(async function () {
+        self.config.newLibNotebook = nbSel.value;
+        await self.save();
+        await self.createMinimal(kind, nbSel.value);
+        self.renderNewLib(box);
+      });
+    };
+    box.querySelector("#cdb-new-paper").addEventListener("click", function () {
+      run("paper");
+    });
+    box.querySelector("#cdb-new-law").addEventListener("click", function () {
+      run("law");
+    });
+    box.querySelector("#cdb-detect").addEventListener("click", function () {
+      self.safe(function () {
+        return self.autoDetect();
+      });
+    });
+  }
+
+  /** 纯数据：扫出「像引注库」的数据库（不含已添加的） */
+  async detectLibraries() {
+    const avs = await this.listAvs();
+    const known = {};
+    this.config.sources.forEach(function (x) {
+      known[x.avID] = 1;
+    });
+    const cands = [];
+    for (let i = 0; i < avs.length; i++) {
+      const a = avs[i];
+      if (known[a.avID]) continue;
+      let cols = [];
+      try {
+        const view = (await this.api("/api/av/renderAttributeView", { id: a.avID, pageSize: 1, page: 1 })).view;
+        cols = avColumns(view);
+      } catch (e) {
+        continue;
+      }
+      if (!cols.length) continue;
+      const g = guessMap(cols);
+      const paperScore = PAPER_ROLES.filter(function (r) {
+        return g[r];
+      }).length;
+      const lawScore = LAW_ROLES.filter(function (r) {
+        return g[r];
+      }).length;
+      const lawish = /法规|条例|办法|通知|法条|文号|效力/.test(
+        a.docName + " " + cols.map(function (c) { return c.name; }).join(" ")
+      );
+      let kind = "";
+      if (lawScore >= 2 && (lawish || paperScore < 4)) kind = "law";
+      else if (paperScore >= 5) kind = "paper";
+      if (!kind) continue;
+      const map = {};
+      (kind === "law" ? LAW_ROLES : PAPER_ROLES).forEach(function (r) {
+        if (g[r]) map[r] = g[r];
+      });
+      cands.push({ avID: a.avID, name: a.docName, kind: kind, map: map, cols: cols.length });
+    }
+    return cands;
+  }
+
+  /** 识别工作空间里「长得像引注库」的数据库，一键绑进来。
+   *  用途：① 别人给的 .sy 模板拖进思源后，不用手对字段；② 老用户换机器后重新挂上自己的库。 */
+  async autoDetect() {
+    const self = this;
+    const cands = await this.detectLibraries();
+    if (!cands.length) {
+      siyuan.showMessage("没找到可以自动绑定的库。要么先用上面的「新建」，要么点「用我已有的数据库」手动对字段。", 7000);
+      return;
+    }
+    let rows = "";
+    cands.forEach(function (c, i) {
+      rows +=
+        '<div class="citeDB-cand" data-i="' + i + '">' +
+        '<label class="citeDB-set-check"><input type="checkbox" data-cb="' + i + '" checked></label>' +
+        '<div class="citeDB-cand-main"><div class="citeDB-cand-name">' + esc(c.name) + "</div>" +
+        '<div class="citeDB-dim">' + c.cols + " 个字段 · 识别到 " + Object.keys(c.map).length + " 个（" +
+        Object.keys(c.map).map(function (r) { return ROLE_LABELS[r]; }).join("/") + "）</div></div>" +
+        '<select class="b3-select" data-kind="' + i + '"><option value="paper"' + (c.kind === "paper" ? " selected" : "") + ">文献库</option>" +
+        '<option value="law"' + (c.kind === "law" ? " selected" : "") + ">脚注库</option></select>" +
+        '<input class="b3-text-field citeDB-set-title" data-name="' + i + '" value="' + esc(c.name) + '">' +
+        "</div>";
+    });
+    const html =
+      '<div class="b3-dialog__content citeDB-panel">' +
+      '<div class="citeDB-set-hint">勾选要加进来的库。字段已按列名对应好，加完之后可以再改。</div>' +
+      '<div class="citeDB-cands">' + rows + "</div>" +
+      '<div class="citeDB-actions"><button class="b3-button b3-button--cancel" id="cdx-cancel">取消</button>' +
+      '<button class="b3-button b3-button--text" id="cdx-ok">加入</button></div></div>';
+    const dialog = new siyuan.Dialog({ title: "识别到的数据库", content: html, width: "680px" });
+    const root = dialog.element;
+    root.querySelector("#cdx-cancel").addEventListener("click", function () {
+      dialog.destroy();
+    });
+    root.querySelector("#cdx-ok").addEventListener("click", function () {
+      let n = 0;
+      cands.forEach(function (c, i) {
+        const cb = root.querySelector('[data-cb="' + i + '"]');
+        if (!cb || !cb.checked) return;
+        const kindSel = root.querySelector('[data-kind="' + i + '"]');
+        const nameIn = root.querySelector('[data-name="' + i + '"]');
+        const kind = (kindSel && kindSel.value) || c.kind;
+        const map = {};
+        (kind === "law" ? LAW_ROLES : PAPER_ROLES).forEach(function (r) {
+          if (c.map[r]) map[r] = c.map[r];
+        });
+        self.config.sources.push({
+          name: (nameIn && nameIn.value.trim()) || c.name,
+          avID: c.avID,
+          kind: kind,
+          origin: "template",
+          map: map,
+        });
+        n++;
+      });
+      if (!n) {
+        siyuan.showMessage("没有勾选任何库", 3000);
+        return;
+      }
+      self.safe(async function () {
+        await self.save();
+        siyuan.showMessage("已加入 " + n + " 个数据源", 3000);
+        dialog.destroy();
+        if (self.settingRefresh) self.settingRefresh();
+      });
+    });
+  }
+
+  /** 在指定笔记本里拿到（或建好）承载库的文档 */
+  async ensureSourceDoc(notebookID) {
+    const found =
+      (await this.api("/api/query/sql", {
+        stmt: "SELECT id FROM blocks WHERE type = 'd' AND box = '" + notebookID + "' AND content = '引注数据源' LIMIT 1",
+      })) || [];
+    if (found.length && found[0].id) return found[0].id;
+    const md =
+      "# 引注数据源\n\n" +
+      "本篇文章用来承载「引注 CiteDB」的数据库，请不要删除。\n\n" +
+      "写文章时在正文里输入 `/` 再打「引注」，就能从下面的库取条目。\n";
+    let lastErr = "";
+    /* 新建笔记本后索引要几秒才就绪（metadata is not ready），所以重试 */
+    for (let i = 0; i < 15; i++) {
+      try {
+        const id = await this.api("/api/filetree/createDocWithMd", {
+          notebook: notebookID,
+          path: "/引注数据源",
+          markdown: md,
+        });
+        if (typeof id === "string" && id) return id;
+      } catch (e) {
+        lastErr = (e && e.message) || String(e);
+        if (lastErr.indexOf("not ready") < 0 && lastErr.indexOf("index") < 0) throw e;
+      }
+      await new Promise(function (r) {
+        setTimeout(r, 1500);
+      });
+    }
+    throw new Error("建文档失败：" + lastErr);
+  }
+
+  /** 一键建最小库：插空 AV 块 → 加列 → 删自带「单选」→ 主键改名 → 记映射 */
+  async createMinimal(kind, notebookID) {
+    const isLaw = kind === "law";
+    const lib = isLaw ? MINIMAL_LAW : MINIMAL_PAPER;
+    const roleOf = isLaw ? LAW_COL_ROLE : PAPER_COL_ROLE;
+    const pkName = lib[0][0];
+    const docID = await this.ensureSourceDoc(notebookID);
+    const avID = makeId();
+    await this.api("/api/block/insertBlock", {
+      parentID: docID,
+      dataType: "dom",
+      data: '<div data-type="NodeAttributeView" data-av-id="' + avID + '" data-av-type="table"></div>',
+    });
+    await new Promise(function (r) {
+      setTimeout(r, 900);
+    });
+    let keys = await this.avKeys(avID);
+    if (!keys.length) throw new Error("数据库没建出来，请重试一次");
+    const pk = keys.find(function (k) {
+      return k.type === "block";
+    });
+    let prev = pk ? pk.id : "";
+    for (let i = 1; i < lib.length; i++) {
+      const keyID = makeId();
+      try {
+        await this.api("/api/av/addAttributeViewKey", {
+          avID: avID,
+          keyID: keyID,
+          keyName: lib[i][0],
+          keyType: lib[i][1],
+          keyIcon: "",
+          previousKeyID: prev,
+        });
+        prev = keyID;
+      } catch (e) {
+        console.warn("[citedb] 建列失败", lib[i][0], e);
+      }
+    }
+    /* 删掉自带的「单选」 */
+    keys = await this.avKeys(avID);
+    for (let i = 0; i < keys.length; i++) {
+      if (keys[i].name === "单选") {
+        try {
+          await this.api("/api/av/removeAttributeViewKey", { avID: avID, keyID: keys[i].id, removeRelationDest: false });
+        } catch (e) {
+          /* 删不掉也不影响用 */
+        }
+      }
+    }
+    /* 主键改名（走未公开事务接口，失败就算了，功能不看列名） */
+    if (pk) {
+      try {
+        await this.api("/api/transactions", {
+          reqId: Date.now(),
+          transactions: [
+            {
+              doOperations: [{ action: "updateAttrViewCol", id: pk.id, avID: avID, name: pkName, type: "block" }],
+              undoOperations: [],
+            },
+          ],
+        });
+      } catch (e) {
+        console.warn("[citedb] 主键改名失败（不影响使用）", e);
+      }
+    }
+    /* 按列名记映射 */
+    keys = await this.avKeys(avID);
+    const map = {};
+    keys.forEach(function (k) {
+      const role = roleOf[k.name];
+      if (role) map[role] = k.id;
+    });
+    if (!map.title && pk) map.title = pk.id;
+    this.config.sources.push({
+      name: isLaw ? "脚注库" : "文献库",
+      avID: avID,
+      kind: kind,
+      origin: "created",
+      map: map,
+    });
+    await this.save();
+    siyuan.showMessage("已新建" + (isLaw ? "脚注库" : "文献库") + "（" + Object.keys(map).length + " 个字段），在「引注数据源」文档里", 6000);
+    return avID;
+  }
+
+  async avKeys(avID) {
+    try {
+      const r = await this.api("/api/av/getAttributeViewKeysByAvID", { avID: avID });
+      return Array.isArray(r) ? r : [];
+    } catch (e) {
+      const view = (await this.api("/api/av/renderAttributeView", { id: avID, pageSize: 1, page: 1 })).view;
+      return avColumns(view);
+    }
+  }
+
+  /* ---------------- 设置：配置导入导出 ---------------- */
+
+  async exportConfig() {
+    const text = JSON.stringify(this.config, null, 2);
+    const blob = new Blob([text], { type: "application/json" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "citedb-config.json";
+    a.click();
+    setTimeout(function () {
+      URL.revokeObjectURL(a.href);
+    }, 3000);
+  }
+
+  async importConfig() {
+    const self = this;
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = ".json,application/json";
+    input.addEventListener("change", function () {
+      const file = input.files && input.files[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = function () {
+        self.safe(async function () {
+          const obj = JSON.parse(String(reader.result || "{}"));
+          if (!obj || !Array.isArray(obj.sources)) throw new Error("不是有效的配置文件");
+          self.config = migrateConfig(obj);
+          await self.save();
+          siyuan.showMessage("已导入 " + self.config.sources.length + " 个数据源", 4000);
+        });
+      };
+      reader.readAsText(file);
+    });
+    input.click();
+  }
+
   async api(path, data) {
     const res = await siyuan.fetchSyncPost(path, data || {});
     if (!res || res.code !== 0) throw new Error((res && res.msg) || ("接口失败 " + path));
@@ -402,7 +1466,7 @@ class CiteDB extends siyuan.Plugin {
     if (!sources.length) {
       rows =
         '<div class="citeDB-empty"><div class="citeDB-empty-title">还没有数据源</div>' +
-        '<div class="citeDB-empty-hint">点「添加数据库」，选文献库或法规库，字段会自动对应好。</div></div>';
+        '<div class="citeDB-empty-hint">点「添加数据源」：可以一键新建库，也可以用自己的数据库（手动对字段）。</div></div>';
     } else {
       rows = '<table class="citeDB-table"><thead><tr><th>数据源</th><th>类型</th><th>字段</th><th></th></tr></thead><tbody>';
       sources.forEach(function (s, i) {
@@ -418,18 +1482,19 @@ class CiteDB extends siyuan.Plugin {
       '<div class="citeDB-row"><span class="citeDB-label">版本</span><span class="citeDB-value">' + VERSION + "</span></div>" +
       rows +
       '<div class="citeDB-actions">' +
-      '<button class="b3-button b3-button--text" id="citeDB-add">添加数据库</button>' +
+      '<button class="b3-button b3-button--text" id="citeDB-add">添加数据源</button>' +
       '<button class="b3-button b3-button--outline" id="citeDB-search">插入引注</button>' +
       '<button class="b3-button b3-button--outline" id="citeDB-refresh">刷新参考文献</button>' +
+      '<button class="b3-button b3-button--outline" id="citeDB-set">设置</button>' +
       "</div>" +
-      '<div class="citeDB-tip">写作时输入 <code>/</code> 再打「引注」即可插入。</div>' +
+      '<div class="citeDB-tip">写作时输入 <code>/</code> 再打「引注」即可插入。<br>格式、插入行为、数据源管理都在 <b>设置 → 集市 → 引注 CiteDB → 齿轮</b>。</div>' +
       "</div>";
 
     const dialog = new siyuan.Dialog({ title: "引注 CiteDB", content: html, width: "560px" });
     const root = dialog.element;
     root.querySelector("#citeDB-add").addEventListener("click", function () {
       dialog.destroy();
-      self.safe(self.openAddSource.bind(self));
+      self.safe(function () { return self.sourceDialog(null, function () { self.openPanel(); }); });
     });
     root.querySelector("#citeDB-search").addEventListener("click", function () {
       dialog.destroy();
@@ -438,6 +1503,10 @@ class CiteDB extends siyuan.Plugin {
     root.querySelector("#citeDB-refresh").addEventListener("click", function () {
       dialog.destroy();
       self.safe(() => self.refreshBib(self.lastProtyle));
+    });
+    root.querySelector("#citeDB-set").addEventListener("click", function () {
+      dialog.destroy();
+      self.safe(function () { return self.openSettings(); });
     });
     root.querySelectorAll(".citeDB-link").forEach(function (a) {
       a.addEventListener("click", function () {
@@ -450,90 +1519,234 @@ class CiteDB extends siyuan.Plugin {
     });
   }
 
-  /* ---------------- 添加数据源 ---------------- */
-  async openAddSource() {
-    const avs = await this.api("/api/query/sql", {
-      stmt:
-        "SELECT b.id AS id, b.markdown AS markdown, d.content AS docName FROM blocks b " +
-        "LEFT JOIN blocks d ON b.parent_id = d.id WHERE b.type = 'av' ORDER BY b.updated DESC LIMIT 80",
-    });
-    if (!avs || !avs.length) {
-      siyuan.showMessage("这个工作空间里没有属性视图（数据库）", 5000, "error");
-      return;
-    }
-    const self = this;
-    let opts = "";
-    const avMap = {};
+  /* ---------------- 数据源：列出所有数据库 ---------------- */
+  async listAvs() {
+    const avs =
+      (await this.api("/api/query/sql", {
+        stmt:
+          "SELECT b.id AS id, b.markdown AS markdown, d.content AS docName FROM blocks b " +
+          "LEFT JOIN blocks d ON b.parent_id = d.id WHERE b.type = 'av' ORDER BY b.updated DESC LIMIT 120",
+      })) || [];
+    const out = [];
+    const seen = {};
     avs.forEach(function (a) {
       const m = a.markdown && /data-av-id="([^"]+)"/.exec(a.markdown);
       const avID = (m && m[1]) || a.id;
-      if (avMap[avID]) return;
-      avMap[avID] = true;
-      const label = (a.docName || a.id) + "  ·  " + avID.slice(-6);
-      opts += '<option value="' + avID + '">' + esc(label) + "</option>";
+      if (seen[avID]) return;
+      seen[avID] = 1;
+      out.push({ avID: avID, docName: a.docName || a.id });
+    });
+    return out;
+  }
+
+  /** 加 / 改一个「自己的库」：手动对字段，每个字段都显示库里第一行的真实值，
+   *  底部实时预览最终引注文字。index 为 null 表示新增。 */
+  async sourceDialog(index, done) {
+    const self = this;
+    const editing = typeof index === "number" ? this.config.sources[index] : null;
+    const avs = await this.listAvs();
+    if (!avs.length) {
+      siyuan.showMessage("这个工作空间里没有数据库：可以先用「新建数据库」建一个", 6000, "error");
+      return;
+    }
+    const used = {};
+    (this.config.sources || []).forEach(function (s, i) {
+      if (i !== index) used[s.avID] = s.name;
+    });
+    const state = {
+      kind: editing ? editing.kind : "paper",
+      avID: editing ? editing.avID : avs[0].avID,
+      name: editing ? editing.name : "",
+      map: Object.assign({}, (editing && editing.map) || {}),
+      cols: [],
+      cells: null,
+      firstTitle: "",
+    };
+    const rolesOf = function (kind) {
+      return kind === "law" ? LAW_ROLES : PAPER_ROLES;
+    };
+    let avOpts = "";
+    avs.forEach(function (a) {
+      avOpts +=
+        '<option value="' +
+        a.avID +
+        '"' +
+        (a.avID === state.avID ? " selected" : "") +
+        ">" +
+        esc(a.docName) +
+        "  ·  " +
+        esc(a.avID.slice(-6)) +
+        (used[a.avID] ? "（已添加）" : "") +
+        "</option>";
     });
     const html =
-      '<div class="b3-dialog__content citeDB-panel">' +
-      '<div class="citeDB-field"><label>数据库</label><select id="citeDB-av">' + opts + "</select></div>" +
-      '<div class="citeDB-field"><label>名称</label><input id="citeDB-name" class="b3-text-field"></div>' +
-      '<div class="citeDB-field"><label>类型</label><select id="citeDB-kind">' +
-      '<option value="paper">文献（图书/期刊）</option><option value="law">法规</option></select></div>' +
-      '<div class="citeDB-map" id="citeDB-map"></div>' +
-      '<div class="citeDB-actions"><button class="b3-button b3-button--cancel" id="citeDB-cancel">取消</button>' +
-      '<button class="b3-button b3-button--text" id="citeDB-ok">保存</button></div>' +
-      "</div>";
-    const dialog = new siyuan.Dialog({ title: "添加数据源", content: html, width: "620px" });
+      '<div class="b3-dialog__content citeDB-panel citeDB-src">' +
+      '<div class="citeDB-field"><label>数据库</label><select id="cd-av" class="b3-select">' + avOpts + "</select></div>" +
+      '<div class="citeDB-field"><label>类型</label><select id="cd-kind" class="b3-select">' +
+      '<option value="paper">文献库（图书/期刊）</option><option value="law">脚注库（法规）</option></select></div>' +
+      '<div class="citeDB-field"><label>名称</label><input id="cd-name" class="b3-text-field"></div>' +
+      '<div class="citeDB-tip" id="cd-msg"></div>' +
+      '<div class="citeDB-map" id="cd-map"></div>' +
+      '<div class="citeDB-prevbox"><div class="citeDB-prevtitle">预览（用库里第一行）</div><div id="cd-prev">—</div></div>' +
+      '<div class="citeDB-actions"><button class="b3-button b3-button--cancel" id="cd-cancel">取消</button>' +
+      '<button class="b3-button b3-button--text" id="cd-ok">保存</button></div></div>';
+    const dialog = new siyuan.Dialog({
+      title: editing ? "修改数据源" : "用我已有的数据库",
+      content: html,
+      width: "680px",
+    });
     const root = dialog.element;
-    const avSel = root.querySelector("#citeDB-av");
-    const nameIn = root.querySelector("#citeDB-name");
-    const kindSel = root.querySelector("#citeDB-kind");
-    const mapBox = root.querySelector("#citeDB-map");
+    const avSel = root.querySelector("#cd-av");
+    const kindSel = root.querySelector("#cd-kind");
+    const nameIn = root.querySelector("#cd-name");
+    const mapBox = root.querySelector("#cd-map");
+    const msg = root.querySelector("#cd-msg");
+    const prevBox = root.querySelector("#cd-prev");
+    kindSel.value = state.kind;
 
-    let viewName = "";
+    const preview = function () {
+      if (!state.cells) {
+        prevBox.textContent = "—";
+        return;
+      }
+      try {
+        const src = { kind: state.kind, map: state.map, name: state.name };
+        const text = citeText(src, state.cells, "", self.config);
+        prevBox.innerHTML =
+          '<div class="citeDB-previtem">' +
+          (state.kind === "law" ? "① " : "[1] ") +
+          esc(text) +
+          "</div>" +
+          '<div class="citeDB-prevhint">（图书页码 / 条号在插入时才填）</div>';
+      } catch (e) {
+        prevBox.textContent = "预览失败：" + ((e && e.message) || e);
+      }
+    };
+
     const renderMap = async function () {
       mapBox.innerHTML = '<div class="citeDB-tip">读取字段…</div>';
-      let keys;
+      let view;
       try {
-        const view = (await self.api("/api/av/renderAttributeView", { id: avSel.value, pageSize: 1, page: 1 })).view;
-        keys = avColumns(view);
-        viewName = avSel.options[avSel.selectedIndex].text.replace(/\s+·\s+\S+$/, "");
-        if (!keys.length || (keys.length === 2 && keys[0].name === "主键")) {
-          siyuan.showMessage("这个库里没有真实数据（可能不是数据库块），换一个试试", 6000, "error");
-        }
+        view = (await self.api("/api/av/renderAttributeView", { id: state.avID, pageSize: 20, page: 1 })).view;
       } catch (e) {
-        mapBox.innerHTML = '<div class="citeDB-tip">读取失败：' + esc(e.message) + "</div>";
+        mapBox.innerHTML = '<div class="citeDB-tip">读取失败：' + esc((e && e.message) || e) + "</div>";
         return;
       }
-      const guess = guessMap(keys);
+      const cols = avColumns(view);
+      /* avRows 丢掉「题名」为空的行，所以要先用猜到的题名兜底，
+         否则刚打开对话框时映射还是空的，会把整库读成 0 行 */
+      const guess = guessMap(cols);
+      const rows = avRows(view, Object.assign({}, guess, state.map));
+      state.cols = cols;
+      state.cells = rows.length ? rows[0].cells : null;
+      state.firstTitle = rows.length ? rows[0].title : "";
+      if (!cols.length) {
+        mapBox.innerHTML = '<div class="citeDB-tip">这个库里没有字段</div>';
+        return;
+      }
+      if (rows.length && cols.filter(function (c) { return c.type === "block"; }).length) {
+        const pk = cols.find(function (c) { return c.type === "block"; });
+        if (!String(state.cells[pk.id] || "").trim()) {
+          msg.textContent = "提示：这个库的第一行主键是空的，预览可能不准，但保存后不影响使用。";
+        }
+      } else {
+        msg.textContent = "";
+      }
+      /* 猜列：已有映射不动，只补没有的 */
+      const roles = rolesOf(state.kind);
+      roles.forEach(function (role) {
+        if (!state.map[role] && guess[role]) state.map[role] = guess[role];
+      });
+      Object.keys(state.map).forEach(function (role) {
+        if (roles.indexOf(role) < 0) delete state.map[role];
+        else if (!cols.some(function (c) { return c.id === state.map[role]; })) delete state.map[role];
+      });
+
       let rowsHtml = "";
-      Object.keys(ROLE_LABELS).forEach(function (role) {
+      roles.forEach(function (role) {
         let o = '<option value="">（不填）</option>';
-        keys.forEach(function (k) {
-          o += '<option value="' + k.id + '"' + (guess[role] === k.id ? " selected" : "") + ">" + esc(k.name) + " · " + k.type + "</option>";
+        cols.forEach(function (k) {
+          o +=
+            '<option value="' +
+            k.id +
+            '"' +
+            (state.map[role] === k.id ? " selected" : "") +
+            ">" +
+            esc(k.name) +
+            " · " +
+            k.type +
+            "</option>";
         });
-        rowsHtml += '<div class="citeDB-field"><label>' + ROLE_LABELS[role] + '</label><select data-role="' + role + '">' + o + "</select></div>";
+        const sample = state.map[role] && state.cells ? String(state.cells[state.map[role]] || "") : "";
+        rowsHtml +=
+          '<div class="citeDB-maprow"><label>' +
+          ROLE_LABELS[role] +
+          '</label><select data-role="' +
+          role +
+          '" class="b3-select">' +
+          o +
+          '</select><span class="citeDB-sample" data-sample="' +
+          role +
+          '">' +
+          esc(sample.length > 22 ? sample.slice(0, 22) + "…" : sample) +
+          "</span></div>";
       });
       mapBox.innerHTML = rowsHtml;
-      if (!nameIn.dataset.touched) nameIn.value = (viewName || "") || nameIn.value;
-    };
-    nameIn.addEventListener("input", function () { nameIn.dataset.touched = "1"; });
-    avSel.addEventListener("change", function () { self.safe(renderMap); });
-    root.querySelector("#citeDB-cancel").addEventListener("click", function () { dialog.destroy(); });
-    root.querySelector("#citeDB-ok").addEventListener("click", function () {
-      const map = {};
-      mapBox.querySelectorAll("select[data-role]").forEach(function (s) {
-        if (s.value) map[s.getAttribute("data-role")] = s.value;
+      mapBox.querySelectorAll("select[data-role]").forEach(function (sel) {
+        sel.addEventListener("change", function () {
+          const role = sel.getAttribute("data-role");
+          if (sel.value) state.map[role] = sel.value;
+          else delete state.map[role];
+          const tag = mapBox.querySelector('[data-sample="' + role + '"]');
+          if (tag) {
+            const v = sel.value && state.cells ? String(state.cells[sel.value] || "") : "";
+            tag.textContent = v.length > 22 ? v.slice(0, 22) + "…" : v;
+          }
+          preview();
+        });
       });
-      if (!map.title) {
-        siyuan.showMessage("至少要指定「题名」对应哪一列", 5000, "error");
+      if (!nameIn.value) nameIn.value = state.name || state.firstTitle || "数据源";
+      preview();
+    };
+
+    avSel.addEventListener("change", function () {
+      state.avID = avSel.value;
+      state.map = {};
+      state.cols = [];
+      state.cells = null;
+      const picked = avs.find(function (a) { return a.avID === state.avID; });
+      if (picked) nameIn.value = picked.docName;
+      self.safe(renderMap);
+    });
+    kindSel.addEventListener("change", function () {
+      state.kind = kindSel.value;
+      state.map = {};
+      self.safe(async function () {
+        await renderMap();
+      });
+    });
+    root.querySelector("#cd-cancel").addEventListener("click", function () {
+      dialog.destroy();
+    });
+    root.querySelector("#cd-ok").addEventListener("click", function () {
+      if (!state.map.title) {
+        siyuan.showMessage("至少要指定「" + ROLE_LABELS.title + "」对应哪一列", 5000, "error");
         return;
       }
-      self.config.sources.push({ name: nameIn.value.trim() || "数据源", avID: avSel.value, kind: kindSel.value, map: map });
+      const rec = {
+        name: nameIn.value.trim() || "数据源",
+        avID: state.avID,
+        kind: state.kind,
+        origin: editing ? editing.origin || "existing" : "existing",
+        map: state.map,
+      };
+      if (editing) self.config.sources[index] = rec;
+      else self.config.sources.push(rec);
       self.safe(async function () {
         await self.save();
-        siyuan.showMessage("已添加：" + nameIn.value, 3000);
+        siyuan.showMessage((editing ? "已更新：" : "已添加：") + rec.name, 3000);
         dialog.destroy();
-        self.openPanel();
+        if (typeof done === "function") done();
       });
     });
     await renderMap();
@@ -549,9 +1762,17 @@ class CiteDB extends siyuan.Plugin {
       return;
     }
     const self = this;
-    const srcOpts = sources
-      .map(function (s, i) { return '<option value="' + i + '">' + esc(s.name) + "</option>"; })
-      .join("");
+    let srcOpts = "";
+    [
+      ["paper", "文献库"],
+      ["law", "脚注库（法规）"],
+    ].forEach(function (pair) {
+      const list = [];
+      sources.forEach(function (s, i) {
+        if (s.kind === pair[0]) list.push('<option value="' + i + '">' + esc(s.name) + "</option>");
+      });
+      if (list.length) srcOpts += '<optgroup label="' + pair[1] + '">' + list.join("") + "</optgroup>";
+    });
     const html =
       '<div class="b3-dialog__content citeDB-search">' +
       '<div class="citeDB-bar"><select id="citeDB-src">' + srcOpts + "</select>" +
@@ -622,9 +1843,17 @@ class CiteDB extends siyuan.Plugin {
       const view = (await self.api("/api/av/renderAttributeView", { id: avID, pageSize: 1000, page: 1 })).view;
       /* 自愈：配置里的列 id 可能来自别的库、或该库后来改过列，认不出来就按列名重新猜一次 */
       const cols = avColumns(view);
-      const mapOk = !!(src.map && src.map.title && cols.some(function (c) { return c.id === src.map.title; }));
-      if (!mapOk && cols.length) {
-        src.map = guessMap(cols);
+      /* 自愈：只补失效的列，用户手改过的映射保留 */
+      const guess = guessMap(cols);
+      let healed = false;
+      src.map = src.map || {};
+      Object.keys(guess).forEach(function (role) {
+        if (!src.map[role] || !cols.some(function (c) { return c.id === src.map[role]; })) {
+          src.map[role] = guess[role];
+          healed = true;
+        }
+      });
+      if (healed) {
         src.avID = avID;
         await self.save();
       }
@@ -789,13 +2018,20 @@ class CiteDB extends siyuan.Plugin {
       list = [];
     }
     const key = String(extra || "").trim();
-    const text = citeText(src, row.cells, key);
+    const text = citeText(src, row.cells, key, this.config);
+    /* 著者-年制要用条目里的作者和年份，跟条目一起存 */
+    const pick = function (role) {
+      const kid = src.map && src.map[role];
+      return kid && row.cells && row.cells[kid] ? String(row.cells[kid]).trim() : "";
+    };
+    const author = pick("author");
+    const year = pick("year");
     let hit = list.find(function (r) {
       return r.docId === row.docID && String(r.article || "") === key;
     });
     if (!hit) {
       const n = list.reduce(function (m, r) { return Math.max(m, r.n || 0); }, 0) + 1;
-      hit = { n: n, docId: row.docID, rowID: row.rowID, linked: !!row.linked, article: key, text: text, src: src.name };
+      hit = { n: n, docId: row.docID, rowID: row.rowID, linked: !!row.linked, article: key, text: text, src: src.name, author: author, year: year };
       list.push(hit);
     } else {
       /* 这条以前引过：文字按这次的选择重写（书名/文号/译者改过都要跟上） */
@@ -803,6 +2039,8 @@ class CiteDB extends siyuan.Plugin {
       hit.linked = !!row.linked;
       hit.src = src.name;
       hit.text = text;
+      hit.author = author;
+      hit.year = year;
     }
     /* 法规行理论上都绑了文档；万一没绑（或库结构变了），按标题回查一次，
        否则插进去只有个圈号，既没有双链也不进尾注 */
@@ -813,23 +2051,30 @@ class CiteDB extends siyuan.Plugin {
         row.linked = true;
         hit.docId = found;
         hit.linked = true;
-        hit.text = citeText(src, row.cells, key);
+        hit.text = citeText(src, row.cells, key, this.config);
       }
     }
     await this.api("/api/attr/setBlockAttrs", { id: docID, attrs: { [ATTR]: JSON.stringify(list) } });
-    const anchor = isLaw ? cir(hit.n) : "[" + hit.n + "]";
+    const markStyle = fmtOf(this.config).markStyle || "sup";
+    /* 著者-年制只对绑定了文档、且条目里有作者的文献生效：
+       没有块引可回写或没有作者时退回编号，免得正文出现「（佚名）」 */
+    const useAY = !isLaw && markStyle === "authoryear" && !!row.docID && !!authorShort(author);
+    const anchor = isLaw ? cir(hit.n) : useAY ? refLabelOf(hit, "authoryear") : "[" + hit.n + "]";
+    /* 上标样式下，文献和法规尾注都上标；行内/著者-年都不上标 */
+    const wrapSup = markStyle === "sup";
     /* 上标 + 思源原生块引：<sup>((id "[1]"))</sup> / <sup>((id "①"))</sup>
        （试过把 data-type="block-ref" 的 span 塞进 sup，思源会把属性吃掉只剩文字，所以走块引） */
-    const md = row.linked
-      ? "<sup>((" + row.docID + ' \"' + anchor + '\"))</sup>'
-      : "<sup>" + anchor + "</sup>";
-    const html = row.linked
-      ? '<sup><span data-type="block-ref" data-id="' + row.docID + '" data-subtype="s">' + anchor + "</span></sup>"
-      : "<sup>" + anchor + "</sup>";
+    const mdBody = row.linked ? "((" + row.docID + ' "' + anchor + '"))' : anchor;
+    const htmlBody = row.linked
+      ? '<span data-type="block-ref" data-id="' + row.docID + '" data-subtype="s">' + anchor + "</span>"
+      : anchor;
+    const md = wrapSup ? "<sup>" + mdBody + "</sup>" : mdBody;
+    const html = wrapSup ? "<sup>" + htmlBody + "</sup>" : htmlBody;
     target.insert(md, html);
     siyuan.showMessage("已插入 " + anchor + (row.linked ? "" : "（纯文字，不能跳转）") + "：" + text, 3000);
     /* 文末已经有列表的，插入后把编号和列表同步一次（没有就先不管，等用户刷新） */
     const self2 = this;
+    if (!(this.config.insert && this.config.insert.autoSync !== false)) return;
     try {
       /* 插完就同步一次：文末还没有列表的（第一次插）也要立刻生出来，
          否则法规的「注」不会出现 */
@@ -951,6 +2196,21 @@ class CiteDB extends siyuan.Plugin {
     const poolR = mkPool(refs);
     const poolN = mkPool(notes);
 
+    /* 文献标记：块引 ((id "[n]")) / ((id "（作者，年：页）"))、老式 [n](siyuan://blocks/id)、纯文字 [n] */
+    const REF_RE = new RegExp(
+      "\\(\\((\\S+?)\\s+\"([^\"]{1,40})\"\\)\\)" +
+        "|\\[(\\d+)\\]\\(siyuan:\\/\\/blocks\\/([^\\s)]+)\\)" +
+        "|\\[(\\d+)\\](?!\\()" +
+        "|(（[^（）]{1,40}）)",
+      "g"
+    );
+    const style = effectiveMarkStyle(this.config, refs);
+    /* 著者-年制里没绑文档的条目只能是纯文字「（作者，年）」，反查表让它能被认回来 */
+    const ayIndex = {};
+    refs.forEach(function (r) {
+      if (authorShort(r.author)) ayIndex[refLabelOf(r, "authoryear")] = r;
+    });
+
     const take = function (kind, docId, oldN) {
       const isRef = kind === "ref";
       const arr = isRef ? refs : notes;
@@ -1003,20 +2263,39 @@ class CiteDB extends siyuan.Plugin {
       }
       if ((one.match(/\{:\s*id="/g) || []).length > 1) continue;
       if (/type="doc"/.test(one)) continue;
-      const clean = one.replace(/\{:[^}]*\}/g, "").trim();
+      /* 只去掉块自身的 ial（行首或行尾那条）。行内 ial 必须留着：
+         剥掉后残留的 <span> 在回写时会把后面的文字整段吞进标签里 */
+      const clean = one
+        .replace(/^([ \t]*(?:[-*+]|\d+\.)?[ \t]*)\{:[^}]*\}[ \t]*/, "$1")
+        .replace(/\n\{:[^}]*\}[ \t]*$/, "")
+        .trim();
       if (!clean) continue;
       let touched = false;
 
-      /* 第一遍：参考文献 [n] */
-      let md = clean.replace(CiteDB.MARKER, function (whole, refId, n1, n2, linkId, n3) {
-        const docId = refId || linkId || "";
-        const oldN = Number(refId ? n1 : n2 || n3);
+      /* 第一遍：文献标记（编号 [n] 或著者-年（作者，年：页）），按当前样式重写 */
+      let md = clean.replace(REF_RE, function (whole, id1, label, n2, linkId, n3, ayText) {
+        /* 纯文字「（作者，年：页）」：只认反查表里有的，普通括号文字不碰 */
+        if (ayText) {
+          const hit0 = ayIndex[whole];
+          if (!hit0) return whole;
+          const e0 = take("ref", hit0.docId || "", Number(hit0.n) || 0);
+          if (!e0) return whole;
+          const lab0 = style === "authoryear" ? refLabelOf(e0, "authoryear") : "[" + e0.n + "]";
+          const id0 = e0.linked && e0.docId ? e0.docId : "";
+          const repl0 = id0 ? "((" + id0 + ' "' + lab0 + '"))' : lab0;
+          if (repl0 !== whole) touched = true;
+          return repl0;
+        }
+        const lab = label || "";
+        if (lab && new RegExp("^[" + CIRCLED_RANGE + "]$").test(lab)) return whole; /* 法规，下一遍处理 */
+        const docId = id1 || linkId || "";
+        const oldN = Number(n2 || n3 || (/^\[(\d+)\]$/.exec(lab) || [])[1] || 0);
         const e = take("ref", docId, oldN);
         if (!e) return whole;
-        const n = e.n;
-        /* 只有条目自己绑了文档才做块引；文献库的书名格是段落，硬链接会打不开 */
+        const useAY = style === "authoryear" && !!authorShort(e.author); /* 保险 */
+        const newLab = useAY ? refLabelOf(e, "authoryear") : "[" + e.n + "]";
         const id2 = e.linked && e.docId ? e.docId : "";
-        const repl = id2 ? "((" + id2 + ' "[' + n + ']"))' : "[" + n + "]";
+        const repl = id2 ? "((" + id2 + ' "' + newLab + '"))' : newLab;
         if (repl !== whole) touched = true;
         return repl;
       });
@@ -1032,12 +2311,16 @@ class CiteDB extends siyuan.Plugin {
         return repl;
       });
 
-      /* 统一成上标：老引用（当初没上标的）也一起升上来 */
+      /* 按当前样式统一上下标：先全部拆掉 <sup>，再视样式重包。
+         整条块引必须排在裸编号前面，否则会连引号里的标签一起包（[1] 变成 <sup>[1]</sup>） */
       const cirClass = CIRCLED_RANGE;
-      const fin = md
-        .replace(new RegExp("(?<!<sup>)(\\(\\([^()]{1,80}\"(?:\\[\\d+\\]|[" + cirClass + "])\"\\)\\))", "g"), "<sup>$1</sup>")
-        .replace(/(?<!<sup>)\[(\d+)\](?!\()/g, "<sup>[$1]</sup>")
-        .trim();
+      const FULLREF = "\\(\\([^()]{1,80}\"[^\"]{1,40}\"\\)\\)";
+      const MARK = "(" + FULLREF + "|\\[\\d+\\]|[" + cirClass + "])";
+      let fin = md.replace(new RegExp("<sup>" + MARK + "</sup>", "g"), "$1");
+      if (style === "sup") {
+        fin = fin.replace(new RegExp("(?<!<sup>)" + MARK, "g"), "<sup>$1</sup>");
+      }
+      fin = fin.trim();
       if (fin !== clean) touched = true;
       if (touched) changed.push({ id: id, md: fin });
     }
@@ -1068,19 +2351,48 @@ class CiteDB extends siyuan.Plugin {
     /* 正文里的引用段落，块渲染文本恰好就是「[1]」「①」，千万别当成条目删掉：
        条目一定是「编号 + 空白 + 内容」 */
     const cirRe = new RegExp("^[" + CIRCLED_RANGE + "]\\s+\\S");
+    const ins = this.config.insert || INSERT_DEFAULTS;
+    const titles = { "参考文献": 1, "注": 1, "注释": 1 };
+    if (ins.refTitle) titles[ins.refTitle] = 1;
+    if (ins.noteTitle) titles[ins.noteTitle] = 1;
+    /* 著者-年制的条目没有编号前缀，按「条目文字」再认一遍 */
+    const attrNow = this.__bibAttrs || null;
+    let known = {};
+    if (attrNow) {
+      ["refs", "notes"].forEach(function (k) {
+        (attrNow[k] || []).forEach(function (e) {
+          const t = String(e.text || "").trim();
+          if (t) known[t] = 1;
+        });
+      });
+    }
     const out = [];
     rows.forEach(function (r) {
       const c = (r.content || "").trim();
-      if (r.type === "h" && (c === "参考文献" || c === "注" || c === "注释")) out.push(r.id);
+      if (r.type === "h" && titles[c]) out.push(r.id);
       else if (r.type === "p" && (/^\[\d+\]\s+\S/.test(c) || cirRe.test(c))) out.push(r.id);
+      else if (r.type === "p" && Object.keys(known).length) {
+        const bare = c.replace(/^(\[\d+\]|[\u2460-\u2473\u3251-\u325f\u32b1-\u32bf])\s+/, "");
+        if (known[c] || known[bare]) out.push(r.id);
+      }
     });
     return out;
   }
 
 
   async refreshBib(protyle, silent) {
+    const self = this;
+    await this.syncConfigFromDisk();
     const docID = this.resolveTarget(protyle).docID;
     const attrs = (await this.api("/api/attr/getBlockAttrs", { id: docID })) || {};
+    const parseNow = function (raw) {
+      try {
+        return JSON.parse(raw || "[]");
+      } catch (e) {
+        return [];
+      }
+    };
+    this.__bibAttrs = { refs: parseNow(attrs[ATTR_REFS]), notes: parseNow(attrs[ATTR_NOTES]) };
 
     /* 1. 先删干净旧的两个区块。上次生成时的块 id 存在属性里（SQL 索引是异步的，
        刚追加的块查不到），再按内容兜底扫一遍。 */
@@ -1111,7 +2423,7 @@ class CiteDB extends siyuan.Plugin {
 
     /* 条目文字一律按库里最新数据重建：书名/文号/译者改过、旧条目是清洗前存的，都能自动更正 */
     const srcByName = {};
-    ((this.data && this.data.sources) || []).forEach(function (x) {
+    ((this.config && this.config.sources) || []).forEach(function (x) {
       srcByName[x.name] = x;
     });
     const rowCache = {};
@@ -1125,16 +2437,32 @@ class CiteDB extends siyuan.Plugin {
             const av = await this.resolveAv(src.avID);
             const view = (await this.api("/api/av/renderAttributeView", { id: av, pageSize: 1000, page: 1 })).view;
             const cols2 = avColumns(view);
-            if (!(src.map && src.map.title && cols2.some(function (c) { return c.id === src.map.title; }))) {
-              src.map = guessMap(cols2);
-            }
+            /* 只在映射里的列已经不存在时补猜，用户手改过的映射不动 */
+            const guess2 = guessMap(cols2);
+            src.map = src.map || {};
+            Object.keys(guess2).forEach(function (role) {
+              if (!src.map[role] || !cols2.some(function (c) { return c.id === src.map[role]; })) {
+                src.map[role] = guess2[role];
+              }
+            });
             rowCache[src.name] = avRows(view, src.map);
           }
           const row = rowCache[src.name].find(function (x) { return x.docID === r.docId; });
           if (row) {
-            r.text = citeText(src, row.cells, r.article || "");
+            r.text = citeText(src, row.cells, r.article || "", self.config);
             r.rowID = row.rowID;
             r.linked = !!row.linked;
+            const cellOf = function (role) {
+              const kid = src.map && src.map[role];
+              return kid && row.cells[kid] ? String(row.cells[kid]).trim() : "";
+            };
+            r.author = cellOf("author");
+            r.year = cellOf("year");
+            /* 年份列空着的（期刊年常写在卷期里）：从条目文字里挑一个 19xx/20xx */
+            if (!r.year) {
+              const ym = /(?:19|20)\d{2}/.exec(String(r.text || ""));
+              if (ym) r.year = ym[0];
+            }
           }
         } catch (e) {
           console.warn("[citedb] 重建条目文字失败", r.docId, e);
@@ -1146,7 +2474,27 @@ class CiteDB extends siyuan.Plugin {
     keptR = keptR.filter(function (r) { return r.text; });
     keptN = keptN.filter(function (r) { return r.text; });
 
-    const self = this;
+    /* 条目里刚补上的作者/年份要落盘，正文再排一遍才认得著者-年制 */
+    const wantStyle = effectiveMarkStyle(this.config, keptR);
+    if (keptR.length || keptN.length) {
+      await this.api("/api/attr/setBlockAttrs", {
+        id: docID,
+        attrs: { [ATTR_REFS]: JSON.stringify(keptR), [ATTR_NOTES]: JSON.stringify(keptN) },
+      });
+      const again = await this.renumber(docID);
+      keptR = again.refs;
+      keptN = again.notes;
+      keptR = keptR.filter(function (r) { return r.text; });
+      keptN = keptN.filter(function (r) { return r.text; });
+    }
+    /* 想要著者-年但有条目缺作者：整体退回编号，不要一半编号一半（作者，年） */
+    if (fmtOf(this.config).markStyle === "authoryear" && wantStyle !== "authoryear") {
+      const lack = keptR.filter(function (r) { return !authorShort(r.author); }).length;
+      if (!silent) {
+        siyuan.showMessage("有 " + lack + " 条文献在库里找不到作者，暂时按编号排；把作者列填上再刷新即可", 6000);
+      }
+    }
+
     if (!keptR.length && !keptN.length) {
       await this.api("/api/attr/setBlockAttrs", { id: docID, attrs: { [ATTR_REFS]: "[]", [ATTR_NOTES]: "[]", [ATTR_BIB]: "" } });
       if (!silent) siyuan.showMessage("正文里没有引用了，文末已清空", 3000);
@@ -1156,19 +2504,33 @@ class CiteDB extends siyuan.Plugin {
     /* 3. 生成两个区块：注（法规，①②）在前，参考文献（GB/T 7714）在后。
        块 id 用追加前后 kramdown 的差集拿，可靠（appendBlock 返回的 doOperations 不一定是全部新建块） */
     const kdBefore = ((await this.api("/api/block/getBlockKramdown", { id: docID })) || {}).kramdown || "";
+    const ins = this.config.insert || INSERT_DEFAULTS;
+    const withLink = function (r) {
+      return ins.linkEntries !== false && r.linked && r.docId
+        ? "[" + r.text + "](siyuan://blocks/" + r.docId + ")"
+        : r.text;
+    };
+    const markStyle = wantStyle;
+    if (markStyle === "authoryear") {
+      keptR = keptR.slice().sort(function (a, b) {
+        const k = String(authorShort(a.author) || a.text || "").localeCompare(String(authorShort(b.author) || b.text || ""), "zh");
+        if (k) return k;
+        return String(a.year || "").localeCompare(String(b.year || ""));
+      });
+    }
     let md = "";
     if (keptN.length) {
-      md += "#### 注\n\n";
+      md += "#### " + (ins.noteTitle || "注") + "\n\n";
       keptN.forEach(function (r) {
-        const body = r.linked && r.docId ? "[" + r.text + "](siyuan://blocks/" + r.docId + ")" : r.text;
+        const body = withLink(r);
         md += cir(r.n) + " " + body + "\n\n";
       });
     }
     if (keptR.length) {
-      md += "#### 参考文献\n\n";
+      md += "#### " + (ins.refTitle || "参考文献") + "\n\n";
       keptR.forEach(function (r) {
-        const body = r.linked && r.docId ? "[" + r.text + "](siyuan://blocks/" + r.docId + ")" : r.text;
-        md += "[" + r.n + "] " + body + "\n\n";
+        const body = withLink(r);
+        md += (markStyle === "authoryear" ? "" : "[" + r.n + "] ") + body + "\n\n";
       });
     }
     await this.api("/api/block/appendBlock", { parentID: docID, dataType: "markdown", data: md.trim() });
@@ -1190,13 +2552,29 @@ class CiteDB extends siyuan.Plugin {
     await this.api("/api/attr/setBlockAttrs", { id: docID, attrs: attrs2 });
     if (!silent) {
       const parts = [];
-      if (keptN.length) parts.push("注 " + keptN.length + " 条");
-      if (keptR.length) parts.push("参考文献 " + keptR.length + " 条");
-      siyuan.showMessage("已更新（" + parts.join("、") + "，编号已重排）", 3000);
+      if (keptN.length) parts.push((this.config.insert && this.config.insert.noteTitle ? this.config.insert.noteTitle : "注") + " " + keptN.length + " 条");
+      if (keptR.length) parts.push((this.config.insert && this.config.insert.refTitle ? this.config.insert.refTitle : "参考文献") + " " + keptR.length + " 条");
+      const styleName = markStyle === "authoryear" ? "著者-出版年" : markStyle === "inline" ? "行内编号" : "上标编号";
+      siyuan.showMessage("已更新（" + parts.join("、") + "，" + styleName + "）", 4000);
     }
   }
 
 }
 
 module.exports = CiteDB;
-CiteDB.__test = { cellText: cellText, avRows: avRows, avColumns: avColumns, citeText: citeText, guessMap: guessMap, esc: esc };
+CiteDB.__test = {
+  cellText: cellText,
+  avRows: avRows,
+  avColumns: avColumns,
+  citeText: citeText,
+  citePaper: citePaper,
+  citeLaw: citeLaw,
+  guessMap: guessMap,
+  renderTpl: renderTpl,
+  migrateConfig: migrateConfig,
+  defaultConfig: defaultConfig,
+  authorList: authorList,
+  authorShort: authorShort,
+  refLabelOf: refLabelOf,
+  esc: esc,
+};

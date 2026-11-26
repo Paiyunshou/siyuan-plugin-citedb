@@ -65,3 +65,48 @@
   background: var(--b3-theme-primary-lightest, rgba(240, 135, 42, .12));
   box-shadow: inset 2px 0 0 var(--b3-theme-primary);
 }
+
+/* ---------- 设置面板 ---------- */
+.citeDB-set-col { display: flex; flex-direction: column; gap: 6px; align-items: flex-start; }
+.citeDB-set-row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin: 6px 0; }
+.citeDB-set-sel { min-width: 220px; }
+.citeDB-set-tpl { width: 100%; min-width: 320px; font-family: var(--b3-font-family-code, monospace); font-size: 12px; }
+.citeDB-set-num { width: 80px; }
+.citeDB-set-title { width: 140px; }
+.citeDB-set-check { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; cursor: pointer; }
+.citeDB-set-check input { margin: 0; }
+.citeDB-set-hint { font-size: 12px; opacity: .6; line-height: 1.7; word-break: break-all; }
+.citeDB-set-group { margin: 4px 0 12px; }
+.citeDB-set-gtitle { font-size: 12px; opacity: .6; margin-bottom: 4px; }
+.citeDB-set-empty { font-size: 12px; opacity: .5; padding: 4px 0 6px; }
+.citeDB-set-ops { white-space: nowrap; text-align: right; }
+.citeDB-dim { font-size: 12px; opacity: .55; }
+.citeDB-set-sources { width: 100%; min-width: 420px; }
+
+/* ---------- 数据源映射对话框 ---------- */
+.citeDB-maprow { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+.citeDB-maprow label { flex: 0 0 118px; font-size: 13px; opacity: .75; }
+.citeDB-maprow select { flex: 0 0 auto; max-width: 260px; }
+.citeDB-sample { flex: 1; min-width: 0; font-size: 12px; opacity: .5; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.citeDB-prevbox {
+  margin-top: 10px; padding: 10px 12px; border-radius: 6px;
+  background: var(--b3-theme-surface-lighter); font-size: 13px; line-height: 1.7;
+}
+.citeDB-prevtitle { font-size: 12px; opacity: .55; margin-bottom: 4px; }
+.citeDB-previtem { word-break: break-all; }
+.citeDB-prevhint { font-size: 11px; opacity: .45; margin-top: 4px; }
+
+/* ---------- 自建设置对话框（面板「设置」按钮） ---------- */
+.citeDB-settings { max-height: 70vh; overflow: auto; }
+.citeDB-set-sec { padding: 10px 0; border-bottom: 1px solid var(--b3-border-color); }
+.citeDB-set-sec:last-of-type { border-bottom: 0; }
+.citeDB-set-title2 { font-size: 13.5px; font-weight: 500; margin-bottom: 4px; }
+.citeDB-set-sec .citeDB-set-hint { margin-bottom: 6px; }
+
+/* ---------- 识别到的数据库 ---------- */
+.citeDB-cands { margin: 8px 0; max-height: 46vh; overflow: auto; }
+.citeDB-cand { display: flex; align-items: center; gap: 10px; padding: 8px 4px; border-bottom: 1px solid var(--b3-border-color); }
+.citeDB-cand-main { flex: 1; min-width: 0; }
+.citeDB-cand-name { font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.citeDB-cand select { flex: 0 0 108px; }
+.citeDB-cand input.citeDB-set-title { flex: 0 0 150px; }

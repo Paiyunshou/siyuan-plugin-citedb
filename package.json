@@ -1,7 +1,7 @@
 {
   "name": "siyuan-plugin-citedb",
-  "version": "0.3.3",
-  "description": "Insert citations from SiYuan databases (attribute views) and auto-build a bibliography.",
+  "version": "1.0.0",
+  "description": "Insert citations from SiYuan databases (attribute views) and auto-build a bibliography, with statute endnotes and three marker styles.",
   "author": "Paiyunshou",
   "license": "MIT",
   "repository": {
@@ -15,7 +15,7 @@
     "bibliography"
   ],
   "scripts": {
-    "check": "node --check index.js"
+    "check": "node --check index.js && node tools/test-unit.js"
   },
   "devDependencies": {}
 }

@@ -12,7 +12,8 @@ PLUGIN = "siyuan-plugin-citedb"
 TARGET = f"data/plugins/{PLUGIN}"
 FILES = ["plugin.json", "package.json", "index.js", "index.css", "icon.png",
          "preview.png", "README.md", "README_zh_CN.md", "CHANGELOG.md", "LICENSE",
-         "i18n/zh_CN.json", "i18n/en_US.json"]
+         "i18n/zh_CN.json", "i18n/en_US.json",
+         "assets/panel.png", "assets/settings.png", "assets/slash.png", "assets/search.png"]
 
 
 def env():
