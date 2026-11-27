@@ -61,7 +61,7 @@ Module._load = function (request) {
 };
 global.document = { getElementById: () => null, createElement: () => ({ style: {}, appendChild() {}, addEventListener() {} }), body: { appendChild() {} } };
 
-const CiteDB = require("/opt/data/workspace/siyuan-plugin-citedb/index.js");
+const CiteDB = require(require("path").join(__dirname, "..", "index.js"));
 
 let pass = 0;
 let fail = 0;

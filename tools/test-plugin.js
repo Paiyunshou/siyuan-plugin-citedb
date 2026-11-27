@@ -18,7 +18,7 @@ const el = () => ({ style:{}, set innerHTML(v){ this._h=v; }, appendChild(){}, r
 global.document = { getElementById: () => null, createElement: () => el(), body: { appendChild(){} } };
 global.console = console;
 
-const CiteDB = require('/opt/data/workspace/siyuan-plugin-citedb/index.js');
+const CiteDB = require(require("path").join(__dirname, "..", "index.js"));
 (async () => {
   const p = new CiteDB();
   await p.onload();

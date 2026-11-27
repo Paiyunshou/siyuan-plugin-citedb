@@ -47,7 +47,7 @@ Module._load = function (r) {
 };
 global.document = { getElementById: () => null, createElement: () => ({ style: {}, appendChild() {}, addEventListener() {} }), body: { appendChild() {} } };
 
-const CiteDB = require("/opt/data/workspace/siyuan-plugin-citedb/index.js");
+const CiteDB = require(require("path").join(__dirname, "..", "index.js"));
 const T = CiteDB.__test;
 const ROLE_LABELS = { title: "题名", author: "作者", container: "出处", year: "年份", issue: "卷期", pages: "页码", wenhao: "文号", type: "类型", place: "出版地", translator: "译者", subtitle: "副标题" };
 

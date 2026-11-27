@@ -96,7 +96,7 @@ Module._load = function (request) {
   return origLoad.apply(this, arguments);
 };
 
-const CiteDB = require("/opt/data/workspace/siyuan-plugin-citedb/index.js");
+const CiteDB = require(require("path").join(__dirname, "..", "index.js"));
 const T = CiteDB.__test;
 
 let pass = 0;
